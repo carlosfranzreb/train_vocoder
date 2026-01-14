@@ -24,11 +24,11 @@ feature_cache = {}
 global synthesis_cache
 synthesis_cache = {}
 
-def make__df(root_path: Path, folders: list[str] = None, ext: str = ".flac") -> pd.DataFrame:
+def make_df(root_path: Path, folders: list[str] = None, ext: str = ".flac") -> pd.DataFrame:
     
-    print(f"[{path}] Computing folders {folders}")
+    print(f"Loading files from {root_path}] with folders {folders}")
     if folders is None or len(folders) == 0:
-        all_files = list((root_path/f).rglob('**/*' + ext))
+        all_files = list((root_path).rglob('**/*' + ext))
     else:
         all_files = list()
         for f in folders:
@@ -36,6 +36,7 @@ def make__df(root_path: Path, folders: list[str] = None, ext: str = ".flac") -> 
 
     speakers = [f.stem.split('-')[0] for f in all_files]
     df = pd.DataFrame({'path': all_files, 'speaker': speakers})
+    print(f"Loaded {len(df)} files")
     return df
 
 
@@ -52,7 +53,7 @@ def main(args):
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    extract(df, wavlm, args.device, Path(args.librispeech_path), Path(args.out_path), SYNTH_WEIGHTINGS, MATCH_WEIGHTINGS, args.ext)
+    extract(df, wavlm, args.device, Path(args.path), Path(args.out_path), SYNTH_WEIGHTINGS, MATCH_WEIGHTINGS, args.ext)
     print("All done!", flush=True)
 
 
@@ -168,7 +169,7 @@ def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Compute matched wavlm features for a librispeech dataset")
+    parser = argparse.ArgumentParser(description="Compute matched wavlm features for a dataset")
 
     parser.add_argument('--path', required=True, type=str)
     parser.add_argument('--folder', action='append')
