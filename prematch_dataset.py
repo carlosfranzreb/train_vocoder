@@ -17,6 +17,7 @@ from torch import Tensor
 from hubconf import wavlm_large
 
 DOWNSAMPLE_FACTOR = 320
+MIN_VECTORS_FOR_PREMATCH = 9000 # 3 minutes
 
 global feature_cache
 feature_cache = {}
@@ -28,9 +29,18 @@ def make_librispeech_df(root_path: Path) -> pd.DataFrame:
     folders = ['train-clean-100', 'dev-clean']
     print(f"[LIBRISPEECH] Computing folders {folders}")
     for f in folders:
-        all_files.extend(list((root_path/f).rglob('**/*.flac')))
+        all_files.extend(list((root_path/f).rglob('**/*.wav')))
     speakers = ['ls-' + f.stem.split('-')[0] for f in all_files]
     df = pd.DataFrame({'path': all_files, 'speaker': speakers})
+    return df
+
+
+def make_neurovoz_df(root_path: Path) -> pd.DataFrame:
+    print(f"[NEUROVOZ] Computing folders {folders}")
+    all_files = list((root_path).rglob('**/*.wav'))
+    speakers = ['nv-' + f.stem.split('_')[2] for f in all_files]
+    df = pd.DataFrame({'path': all_files, 'speaker': speakers})
+
     return df
 
 
@@ -41,6 +51,7 @@ def main(args):
 
     print(f"Matching weightings: {MATCH_WEIGHTINGS.squeeze()}\nSynthesis weightings: {SYNTH_WEIGHTINGS.squeeze()}")
     ls_df = make_librispeech_df(Path(args.librispeech_path))
+    # nv_df = make_neurovoz_df(Path(args.neurovoz_path))
 
     print(f"Loading wavlm.")
     wavlm = wavlm_large(pretrained=True, progress=True, device=args.device)
@@ -54,7 +65,7 @@ def main(args):
 def path2pools(path: Path, wavlm: nn.Module(), match_weights: Tensor, synth_weights: Tensor, device):
     """Given a waveform `path`, compute the matching pool"""
 
-    uttrs_from_same_spk = sorted(list(path.parent.rglob('**/*.flac')))
+    uttrs_from_same_spk = sorted(list(path.parent.rglob('**/*.wav')))
     uttrs_from_same_spk.remove(path)
     matching_pool = []
     synth_pool = []
@@ -71,8 +82,14 @@ def path2pools(path: Path, wavlm: nn.Module(), match_weights: Tensor, synth_weig
 
         matching_pool.append(matching_feats.cpu())
         synth_pool.append(synth_feats.cpu())
-    matching_pool = torch.concat(matching_pool, dim=0)
-    synth_pool = torch.concat(synth_pool, dim=0)
+
+    try:
+        matching_pool = torch.concat(matching_pool, dim=0)
+        synth_pool = torch.concat(synth_pool, dim=0)
+    except RuntimeError as err:
+        matching_pool = torch.empty((1, 1024), device=device)
+        synth_pool = torch.tensor((1, 1024), device=device)
+
     return matching_pool, synth_pool # (N, dim)
 
 
@@ -80,7 +97,9 @@ def path2pools(path: Path, wavlm: nn.Module(), match_weights: Tensor, synth_weig
 def get_full_features(path, wavlm, device):
 
     x, sr = torchaudio.load(path)
-    assert sr == 16000
+    if sr != 16000:
+        x = torchaudio.transforms.Resample(sr, 16000)(x)
+
     # This does not work i.t.o the hifigan training.
     # x = F.pad(x, (DOWNSAMPLE_FACTOR//2, DOWNSAMPLE_FACTOR - DOWNSAMPLE_FACTOR//2), value=0)
     # This does.
@@ -126,7 +145,7 @@ def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path:
 
         matching_pool, synth_pool = path2pools(row.path, wavlm, match_weights, synth_weights, device)
 
-        if not args.prematch:
+        if not args.prematch or matching_pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
             out_feats = source_feats.cpu()
         else:
             dists = fast_cosine_dist(source_feats.cpu(), matching_pool.cpu()).cpu()
