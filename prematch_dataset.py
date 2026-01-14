@@ -24,23 +24,18 @@ feature_cache = {}
 global synthesis_cache
 synthesis_cache = {}
 
-def make_librispeech_df(root_path: Path) -> pd.DataFrame:
-    all_files = []
-    folders = ['train-clean-100', 'dev-clean']
-    print(f"[LIBRISPEECH] Computing folders {folders}")
-    for f in folders:
-        all_files.extend(list((root_path/f).rglob('**/*.wav')))
-    speakers = ['ls-' + f.stem.split('-')[0] for f in all_files]
+def make__df(root_path: Path, folders: list[str] = None, ext: str = ".flac") -> pd.DataFrame:
+    
+    print(f"[{path}] Computing folders {folders}")
+    if folders is None or len(folders) == 0:
+        all_files = list((root_path/f).rglob('**/*' + ext))
+    else:
+        all_files = list()
+        for f in folders:
+            all_files.extend(list((root_path/f).rglob('**/*' + ext)))
+
+    speakers = [f.stem.split('-')[0] for f in all_files]
     df = pd.DataFrame({'path': all_files, 'speaker': speakers})
-    return df
-
-
-def make_neurovoz_df(root_path: Path) -> pd.DataFrame:
-    print(f"[NEUROVOZ] Computing folders {folders}")
-    all_files = list((root_path).rglob('**/*.wav'))
-    speakers = ['nv-' + f.stem.split('_')[2] for f in all_files]
-    df = pd.DataFrame({'path': all_files, 'speaker': speakers})
-
     return df
 
 
@@ -50,22 +45,21 @@ def main(args):
     MATCH_WEIGHTINGS = F.one_hot(torch.tensor(args.matching_layer), num_classes=25).float().to(device)[:, None]
 
     print(f"Matching weightings: {MATCH_WEIGHTINGS.squeeze()}\nSynthesis weightings: {SYNTH_WEIGHTINGS.squeeze()}")
-    ls_df = make_librispeech_df(Path(args.librispeech_path))
-    # nv_df = make_neurovoz_df(Path(args.neurovoz_path))
+    df = make_df(Path(args.path), folders=args.folder, ext=args.ext)
 
     print(f"Loading wavlm.")
     wavlm = wavlm_large(pretrained=True, progress=True, device=args.device)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    extract(ls_df, wavlm, args.device, Path(args.librispeech_path), Path(args.out_path), SYNTH_WEIGHTINGS, MATCH_WEIGHTINGS)
+    extract(df, wavlm, args.device, Path(args.librispeech_path), Path(args.out_path), SYNTH_WEIGHTINGS, MATCH_WEIGHTINGS, args.ext)
     print("All done!", flush=True)
 
 
-def path2pools(path: Path, wavlm: nn.Module(), match_weights: Tensor, synth_weights: Tensor, device):
+def path2pools(path: Path, wavlm: nn.Module(), match_weights: Tensor, synth_weights: Tensor, device: str, ext: str):
     """Given a waveform `path`, compute the matching pool"""
 
-    uttrs_from_same_spk = sorted(list(path.parent.rglob('**/*.wav')))
+    uttrs_from_same_spk = sorted(list(path.parent.rglob('**/*' + ext)))
     uttrs_from_same_spk.remove(path)
     matching_pool = []
     synth_pool = []
@@ -125,7 +119,7 @@ def fast_cosine_dist(source_feats, matching_pool):
 
 
 @torch.inference_mode()
-def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path: Path, synth_weights: Tensor, match_weights: Tensor):
+def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path: Path, synth_weights: Tensor, match_weights: Tensor, ext: str):
     
     pb = progress_bar(df.iterrows(), total=len(df))
 
@@ -143,7 +137,7 @@ def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path:
             source_feats = get_full_features(row.path, wavlm, device)
             source_feats = ( source_feats*match_weights[:, None] ).sum(dim=0) # (seq_len, dim)
 
-        matching_pool, synth_pool = path2pools(row.path, wavlm, match_weights, synth_weights, device)
+        matching_pool, synth_pool = path2pools(row.path, wavlm, match_weights, synth_weights, device, ext)
 
         if not args.prematch or matching_pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
             out_feats = source_feats.cpu()
@@ -176,10 +170,12 @@ def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Compute matched wavlm features for a librispeech dataset")
 
-    parser.add_argument('--librispeech_path', required=True, type=str)
+    parser.add_argument('--path', required=True, type=str)
+    parser.add_argument('--folder', action='append')
     parser.add_argument('--seed', default=123, type=int)
     parser.add_argument('--out_path', required=True, type=str)
     parser.add_argument('--device', default='cuda', type=str)
+    parser.add_argument('--ext', default='.flac', type=str)
     parser.add_argument('--topk', type=int, default=4)
     parser.add_argument('--matching_layer', type=int, default=6)
     parser.add_argument('--synthesis_layer', type=int, default=6)
