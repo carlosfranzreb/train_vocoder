@@ -26,27 +26,19 @@ global feature_cache
 feature_cache = {}
 
 
-def make_df(
-    root_path: Path, folders: list[str] = None, ext: str = ".flac"
-) -> pd.DataFrame:
+def make_df(root_path: Path, ext: str = ".flac") -> pd.DataFrame:
 
-    LOGGER.info(f"Loading files from {root_path}] with folders {folders}")
-    if folders is None or len(folders) == 0:
-        all_files = list((root_path).rglob("**/*" + ext))
-    else:
-        all_files = list()
-        for f in folders:
-            all_files.extend(list((root_path / f).rglob("**/*" + ext)))
-
-    speakers = [f.stem.split("-")[0] for f in all_files]
-    df = pd.DataFrame({"path": all_files, "speaker": speakers})
+    LOGGER.info(f"Loading files from {root_path}")
+    files = list((root_path).rglob("**/*" + ext))
+    speakers = [f.stem.split("-")[0] for f in files]
+    df = pd.DataFrame({"path": files, "speaker": speakers})
     LOGGER.info(f"Loaded {len(df)} files")
 
     return df
 
 
 def main(args):
-    df = make_df(Path(args.path), folders=args.folder, ext=args.ext)
+    df = make_df(Path(args.path), ext=args.ext)
 
     LOGGER.info(f"Loading wavlm.")
     wavlm = init_wavlm_large(pretrained=True, progress=True, device=args.device)
@@ -80,11 +72,11 @@ def get_full_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
     x = F.pad(x, (0, n_pad), value=0)
 
     # extract the representation of each layer
-    x_gpu = x.to(device)
+    x = x.to(device)
     layer_results = wavlm.extract_features(
-        x_gpu, output_layer=wavlm.extract_from_layer, ret_layer_results=True
+        x, output_layer=wavlm.extract_from_layer, ret_layer_results=True
     )[0][1]
-    features = torch.cat([x.squeeze() for x, _ in layer_results], dim=0)
+    features = torch.cat([f.squeeze() for f, _ in layer_results], dim=0)
 
     return features
 
@@ -130,28 +122,34 @@ def extract(
 
             rel_path = Path(row.path).relative_to(ls_path)
             target_path = (out_path / rel_path).with_suffix(".pt")
-            if resume:
-                if target_path.is_file():
-                    LOGGER.warning(f"Features already exist for {rel_path}")
-                    continue
+            if resume and target_path.is_file():
+                LOGGER.warning(f"Features already exist for {rel_path}")
+                target_path = None
 
             os.makedirs(target_path.parent, exist_ok=True)
             feats.append(get_full_features(row.path, wavlm, device))
             dump_paths.append(target_path)
 
         # do the pre-matching if needed, when there are enough target feats
-        matched_feats = list()
+        # TODO: create pool once, and then use masking to remove source_feats
         if prematch:
+            matched_feats = list()
             for utt_idx in range(len(feats)):
+                if resume and dump_paths[utt_idx] is None:
+                    continue
+
                 source_feats = feats[utt_idx]
-                pool = [feats[idx] for idx in range(len(feats)) if idx != utt_idx]
+                pool = torch.cat(
+                    [feats[idx] for idx in range(len(feats)) if idx != utt_idx], dim=0
+                )
+
                 if pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
                     LOGGER.warning(
                         f"Not enough target vectors for {dump_paths[utt_idx]}"
                     )
-                    matched_feats.append(source_feats.cpu())
+                    matched_feats.append(source_feats)
                 else:
-                    dists = fast_cosine_dist(source_feats.cpu(), pool.cpu()).cpu()
+                    dists = fast_cosine_dist(source_feats, pool)
                     best = dists.topk(k=topk, dim=-1, largest=False)
                     matched_feats.append(pool[best.indices].mean(dim=1))
 
@@ -169,7 +167,6 @@ if __name__ == "__main__":
 
     parser.add_argument("path", type=str)
     parser.add_argument("out_path", type=str)
-    parser.add_argument("--folder", action="append")
     parser.add_argument("--seed", default=123, type=int)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--ext", default=".flac", type=str)
