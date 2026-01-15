@@ -1,5 +1,7 @@
 """
 If torchcodec, cannot find ffmpeg: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+
+TODO:
 """
 
 import argparse
@@ -129,34 +131,68 @@ def extract(
             feats.append(get_features(row.path, wavlm, device))
             dump_paths.append(target_path)
 
-        # do the pre-matching if needed, when there are enough target feats
-        # TODO: create pool once, and then use masking to remove source_feats
         if prematch:
-            matched_feats = list()
-            for utt_idx in range(len(feats)):
-                if resume and dump_paths[utt_idx] is None:
-                    continue
-
-                source_feats = feats[utt_idx]
-                pool = torch.cat(
-                    [feats[idx] for idx in range(len(feats)) if idx != utt_idx], dim=0
-                )
-
-                if pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
-                    LOGGER.warning(
-                        f"Not enough target vectors for {dump_paths[utt_idx]}"
-                    )
-                    matched_feats.append(source_feats)
-                else:
-                    dists = fast_cosine_dist(source_feats, pool)
-                    best = dists.topk(k=topk, dim=-1, largest=False)
-                    matched_feats.append(pool[best.indices].mean(dim=1))
-
-            feats = matched_feats
+            feats = prematch_feats(feats, topk, dump_paths, resume)
 
         # dump the features and continue
         for dump_path, dump_feats in zip(dump_paths, feats):
             torch.save(dump_feats.cpu().half(), dump_path)
+
+
+def prematch_feats(
+    feats: list[Tensor], topk: int, dump_paths: list[str], resume: bool
+) -> list[Tensor]:
+    """
+    Given the WavLM features of several utterances of the same speaker, pre-match
+    them by doing a kNN regression where the utteance being regressed is removed
+    from the pool.
+    """
+
+    # vectorize feats and keep track of the utterances
+    device = feats[0].device
+    n_utts = len(feats)
+
+    # Pre-calculate offsets to avoid repeated masking
+    feat_lens = [f.shape[0] for f in feats]
+    offsets = torch.cumsum([0] + feat_lens)
+
+    utts = torch.hstack(
+        [
+            torch.ones(feats[idx].shape[0], dtype=torch.int) * idx
+            for idx in range(len(feats))
+        ]
+    )
+    feats = torch.vstack(feats)
+
+    # compute cosine distances between all features
+    dists = torch.zeros((feats.shape[0], feats.shape[0]), device=device)
+    for idx_a in range(n_utts):
+        start_a, end_a = offsets[idx_a], offsets[idx_a + 1]
+        for idx_b in range(idx_a + 1, n_utts):
+            start_b, end_b = offsets[idx_b], offsets[idx_b + 1]
+            utt_dists = fast_cosine_dist(feats[start_a:end_a], feats[start_b:end_b])
+            dists[start_a:end_a, start_b:end_b] = utt_dists
+            dists[start_b:end_b, start_a:end_a] = utt_dists.T
+
+    # do the pre-matching
+    matched_feats = list()
+    for utt_idx in torch.arange(n_utts):
+
+        if resume and dump_paths[utt_idx] is None:
+            continue
+
+        utt_mask = utts == utt_idx
+        target_feats = feats[~utt_mask]
+
+        if target_feats.shape[0] < MIN_VECTORS_FOR_PREMATCH:
+            LOGGER.warning(f"Not enough target vectors for {dump_paths[utt_idx]}")
+            matched_feats.append(feats[utt_mask])
+        else:
+            utt_dists = dists[utt_mask][:, ~utt_mask]
+            best = utt_dists.topk(k=topk, dim=-1, largest=False)
+            matched_feats.append(target_feats[best.indices].mean(dim=1))
+
+    return matched_feats
 
 
 if __name__ == "__main__":
