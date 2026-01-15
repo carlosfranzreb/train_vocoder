@@ -1,7 +1,7 @@
 import argparse
+import logging
 import gc
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -11,25 +11,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from fastprogress.fastprogress import master_bar, progress_bar
+from fastprogress.fastprogress import progress_bar
 from torch import Tensor
 
 from hubconf import wavlm_large
 
 DOWNSAMPLE_FACTOR = 320
 MIN_VECTORS_FOR_PREMATCH = 9000  # 3 minutes
+LOGGER = logging.getLogger("prematch_dataset.log")
 
 global feature_cache
 feature_cache = {}
-global synthesis_cache
-synthesis_cache = {}
 
 
 def make_df(
     root_path: Path, folders: list[str] = None, ext: str = ".flac"
 ) -> pd.DataFrame:
 
-    print(f"Loading files from {root_path}] with folders {folders}")
+    LOGGER.info(f"Loading files from {root_path}] with folders {folders}")
     if folders is None or len(folders) == 0:
         all_files = list((root_path).rglob("**/*" + ext))
     else:
@@ -39,29 +38,20 @@ def make_df(
 
     speakers = [f.stem.split("-")[0] for f in all_files]
     df = pd.DataFrame({"path": all_files, "speaker": speakers})
-    print(f"Loaded {len(df)} files")
+    LOGGER.info(f"Loaded {len(df)} files")
+
     return df
 
 
 def main(args):
     device = torch.device(args.device)
-    SYNTH_WEIGHTINGS = (
-        F.one_hot(torch.tensor(args.synthesis_layer), num_classes=25)
-        .float()
-        .to(device)[:, None]
+    weights = (
+        F.one_hot(torch.tensor(args.layer), num_classes=25).float().to(device)[:, None]
     )
-    MATCH_WEIGHTINGS = (
-        F.one_hot(torch.tensor(args.matching_layer), num_classes=25)
-        .float()
-        .to(device)[:, None]
-    )
-
-    print(
-        f"Matching weightings: {MATCH_WEIGHTINGS.squeeze()}\nSynthesis weightings: {SYNTH_WEIGHTINGS.squeeze()}"
-    )
+    LOGGER.info(f"Matching weights: {weights.squeeze()}")
     df = make_df(Path(args.path), folders=args.folder, ext=args.ext)
 
-    print(f"Loading wavlm.")
+    LOGGER.info(f"Loading wavlm.")
     wavlm = wavlm_large(pretrained=True, progress=True, device=args.device)
 
     np.random.seed(args.seed)
@@ -72,51 +62,41 @@ def main(args):
         args.device,
         Path(args.path),
         Path(args.out_path),
-        SYNTH_WEIGHTINGS,
-        MATCH_WEIGHTINGS,
+        weights,
         args.ext,
     )
-    print("All done!", flush=True)
+    LOGGER.info("All done!")
 
 
 def path2pools(
     path: Path,
-    wavlm: nn.Module(),
-    match_weights: Tensor,
-    synth_weights: Tensor,
+    wavlm: nn.Module,
+    weights: Tensor,
     device: str,
     ext: str,
-):
+) -> Tensor:
     """Given a waveform `path`, compute the matching pool"""
 
     uttrs_from_same_spk = sorted(list(path.parent.rglob("**/*" + ext)))
     uttrs_from_same_spk.remove(path)
-    matching_pool = []
-    synth_pool = []
+    pool = list()
     for pth in uttrs_from_same_spk:
-        if pth in feature_cache and pth in synthesis_cache:
-            matching_feats = feature_cache[pth].float()  # (seq_len, dim)
-            synth_feats = synthesis_cache[pth].float()  # (seq_len, dim)
+        if pth in feature_cache:
+            feats = feature_cache[pth].float()  # (seq_len, dim)
         else:
             feats = get_full_features(pth, wavlm, device)
-            matching_feats = (feats * match_weights[:, None]).sum(
-                dim=0
-            )  # (seq_len, dim)
-            synth_feats = (feats * synth_weights[:, None]).sum(dim=0)  # (seq_len, dim)
-            feature_cache[pth] = matching_feats.half().cpu()
-            synthesis_cache[pth] = synth_feats.half().cpu()
+            feats = (feats * weights[:, None]).sum(dim=0)  # (seq_len, dim)
+            feature_cache[pth] = feats.half().cpu()
 
-        matching_pool.append(matching_feats.cpu())
-        synth_pool.append(synth_feats.cpu())
+        pool.append(feats.cpu())
 
     try:
-        matching_pool = torch.concat(matching_pool, dim=0)
-        synth_pool = torch.concat(synth_pool, dim=0)
-    except RuntimeError as err:
-        matching_pool = torch.empty((1, 1024), device=device)
-        synth_pool = torch.tensor((1, 1024), device=device)
+        pool = torch.concat(pool, dim=0)
+    except RuntimeError:
+        LOGGER.warning(f"No matching pool available for file {path}")
+        pool = torch.empty((1, 1024), device=device)
 
-    return matching_pool, synth_pool  # (N, dim)
+    return pool  # (N, dim)
 
 
 @torch.inference_mode()
@@ -144,17 +124,17 @@ def get_full_features(path, wavlm, device):
     return features
 
 
-def fast_cosine_dist(source_feats, matching_pool):
+def fast_cosine_dist(source_feats, pool):
     source_norms = torch.norm(source_feats, p=2, dim=-1)
-    matching_norms = torch.norm(matching_pool, p=2, dim=-1)
+    norms = torch.norm(pool, p=2, dim=-1)
     dotprod = (
-        -torch.cdist(source_feats[None], matching_pool[None], p=2)[0] ** 2
+        -torch.cdist(source_feats[None], pool[None], p=2)[0] ** 2
         + source_norms[:, None] ** 2
-        + matching_norms[None] ** 2
+        + norms[None] ** 2
     )
     dotprod /= 2
 
-    dists = 1 - (dotprod / (source_norms[:, None] * matching_norms[None]))
+    dists = 1 - (dotprod / (source_norms[:, None] * norms[None]))
     return dists
 
 
@@ -165,8 +145,7 @@ def extract(
     device,
     ls_path: Path,
     out_path: Path,
-    synth_weights: Tensor,
-    match_weights: Tensor,
+    weights: Tensor,
     ext: str,
 ):
 
@@ -178,31 +157,30 @@ def extract(
         if args.resume:
             if targ_path.is_file():
                 continue
-        # if targ_path.is_file(): continue
+
         os.makedirs(targ_path.parent, exist_ok=True)
 
         if Path(row.path) in feature_cache:
             source_feats = feature_cache[Path(row.path)].float()
         else:
             source_feats = get_full_features(row.path, wavlm, device)
-            source_feats = (source_feats * match_weights[:, None]).sum(
+            source_feats = (source_feats * weights[:, None]).sum(
                 dim=0
             )  # (seq_len, dim)
 
-        matching_pool, synth_pool = path2pools(
-            row.path, wavlm, match_weights, synth_weights, device, ext
-        )
+        pool = path2pools(row.path, wavlm, weights, device, ext)
 
-        if not args.prematch or matching_pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
+        if not args.prematch or pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
             out_feats = source_feats.cpu()
         else:
-            dists = fast_cosine_dist(source_feats.cpu(), matching_pool.cpu()).cpu()
+            dists = fast_cosine_dist(source_feats.cpu(), pool.cpu()).cpu()
             best = dists.topk(k=args.topk, dim=-1, largest=False)  # (src_len, 4)
-            out_feats = synth_pool[best.indices].mean(dim=1)  # (N, dim)
+            out_feats = pool[best.indices].mean(dim=1)  # (N, dim)
 
         # save matched sequence
         if i < 3:
-            print("Feature has shape: ", out_feats.shape, flush=True)
+            LOGGER.info("Feature has shape: ", out_feats.shape)
+
         # 3. save
         torch.save(out_feats.cpu().half(), str(targ_path))
         if hasattr(pb, "child"):
@@ -211,12 +189,12 @@ def extract(
             pb.main_bar.comment = str(rel_path)
         else:
             pb.wait_for = min(pb.wait_for, 10)
+
         pb.comment = str(rel_path)
 
         if i % 1000 == 0:
-            print(f"Done {i:,d}/{len(df):,d}", flush=True)
+            LOGGER.info(f"Done {i:,d}/{len(df):,d}")
             feature_cache.clear()
-            synthesis_cache.clear()
             gc.collect()
             time.sleep(4)
 
@@ -233,8 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--ext", default=".flac", type=str)
     parser.add_argument("--topk", type=int, default=4)
-    parser.add_argument("--matching_layer", type=int, default=6)
-    parser.add_argument("--synthesis_layer", type=int, default=6)
+    parser.add_argument("--layer", type=int, default=6)
     parser.add_argument("--prematch", action="store_true", help="prematch")
     parser.add_argument("--resume", action="store_true")
 
