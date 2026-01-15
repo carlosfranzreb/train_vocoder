@@ -1,8 +1,10 @@
+"""
+If torchcodec, cannot find ffmpeg: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+"""
+
 import argparse
 import logging
-import gc
 import os
-import time
 from pathlib import Path
 
 import numpy as np
@@ -11,10 +13,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-import torchaudio
+from torchcodec.decoders import AudioDecoder
 from tqdm import tqdm
 
-from hubconf import wavlm_large
+from wavlm import init_wavlm_large
 
 DOWNSAMPLE_FACTOR = 320
 MIN_VECTORS_FOR_PREMATCH = 9000  # 3 minutes
@@ -44,15 +46,11 @@ def make_df(
 
 
 def main(args):
-    device = torch.device(args.device)
-    weights = (
-        F.one_hot(torch.tensor(args.layer), num_classes=25).float().to(device)[:, None]
-    )
-    LOGGER.info(f"Matching weights: {weights.squeeze()}")
     df = make_df(Path(args.path), folders=args.folder, ext=args.ext)
 
     LOGGER.info(f"Loading wavlm.")
-    wavlm = wavlm_large(pretrained=True, progress=True, device=args.device)
+    wavlm = init_wavlm_large(pretrained=True, progress=True, device=args.device)
+    wavlm.extract_from_layer = args.layer
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -60,71 +58,42 @@ def main(args):
         df,
         wavlm,
         args.device,
+        args.prematch,
+        args.topk,
         Path(args.path),
         Path(args.out_path),
-        weights,
-        args.ext,
+        args.resume,
     )
     LOGGER.info("All done!")
 
 
-def path2pools(
-    path: Path,
-    wavlm: nn.Module,
-    weights: Tensor,
-    device: str,
-    ext: str,
-) -> Tensor:
-    """Given a waveform `path`, compute the matching pool"""
-
-    uttrs_from_same_spk = sorted(list(path.parent.rglob("**/*" + ext)))
-    uttrs_from_same_spk.remove(path)
-    pool = list()
-    for pth in uttrs_from_same_spk:
-        if pth in feature_cache:
-            feats = feature_cache[pth].float()  # (seq_len, dim)
-        else:
-            feats = get_full_features(pth, wavlm, device)
-            feats = (feats * weights[:, None]).sum(dim=0)  # (seq_len, dim)
-            feature_cache[pth] = feats.half().cpu()
-
-        pool.append(feats.cpu())
-
-    try:
-        pool = torch.concat(pool, dim=0)
-    except RuntimeError:
-        LOGGER.warning(f"No matching pool available for file {path}")
-        pool = torch.empty((1, 1024), device=device)
-
-    return pool  # (N, dim)
-
-
 @torch.inference_mode()
-def get_full_features(path, wavlm, device):
+def get_full_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
+    """
+    Extracts WavLM features from the given audio path, and returns them as a single
+    tensor of shape (n_feats, feat_dim).
+    """
 
-    x, sr = torchaudio.load(path)
-    if sr != 16000:
-        x = torchaudio.transforms.Resample(sr, 16000)(x)
-
-    # This does not work i.t.o the hifigan training.
-    # x = F.pad(x, (DOWNSAMPLE_FACTOR//2, DOWNSAMPLE_FACTOR - DOWNSAMPLE_FACTOR//2), value=0)
-    # This does.
+    # load audio and ensure it's divisible by WavLM's featex
+    x = AudioDecoder(path, sample_rate=16_000).get_all_samples().data
     n_pad = DOWNSAMPLE_FACTOR - (x.shape[-1] % DOWNSAMPLE_FACTOR)
     x = F.pad(x, (0, n_pad), value=0)
 
     # extract the representation of each layer
-    wav_input_16khz = x.to(device)
-    rep, layer_results = wavlm.extract_features(
-        wav_input_16khz, output_layer=wavlm.cfg.encoder_layers, ret_layer_results=True
-    )[0]
-    features = torch.cat(
-        [x.transpose(0, 1) for x, _ in layer_results], dim=0
-    )  # (n_layers, seq_len, dim)
+    x_gpu = x.to(device)
+    layer_results = wavlm.extract_features(
+        x_gpu, output_layer=wavlm.extract_from_layer, ret_layer_results=True
+    )[0][1]
+    features = torch.cat([x.squeeze() for x, _ in layer_results], dim=0)
 
     return features
 
 
-def fast_cosine_dist(source_feats, pool):
+def fast_cosine_dist(source_feats: Tensor, pool: Tensor) -> Tensor:
+    """
+    Receives two tensors of shape (n_feats_a, feat_dim), (n_feats_b, feat_dim) and
+    returns the distances between all pairs of their features (n_feats_a, n_feats_b).
+    """
     source_norms = torch.norm(source_feats, p=2, dim=-1)
     norms = torch.norm(pool, p=2, dim=-1)
     dotprod = (
@@ -142,59 +111,55 @@ def fast_cosine_dist(source_feats, pool):
 def extract(
     df: pd.DataFrame,
     wavlm: nn.Module,
-    device,
+    device: str,
+    prematch: bool,
+    topk: int,
     ls_path: Path,
     out_path: Path,
-    weights: Tensor,
-    ext: str,
+    resume: bool,
 ):
 
-    for i, row in tqdm(df.iterrows(), total=len(df)):
-        rel_path = Path(row.path).relative_to(ls_path)
-        targ_path = (out_path / rel_path).with_suffix(".pt")
-        if args.resume:
-            if targ_path.is_file():
-                continue
+    # iterate over all unique speakers
+    for i, (speaker, group) in enumerate(
+        tqdm(df.groupby("speaker"), total=df["speaker"].nunique())
+    ):
+        # extract features from all the speaker's utterances
+        feats = list()
+        dump_paths = list()
+        for _, row in group.iterrows():
 
-        os.makedirs(targ_path.parent, exist_ok=True)
+            rel_path = Path(row.path).relative_to(ls_path)
+            target_path = (out_path / rel_path).with_suffix(".pt")
+            if resume:
+                if target_path.is_file():
+                    LOGGER.warning(f"Features already exist for {rel_path}")
+                    continue
 
-        if Path(row.path) in feature_cache:
-            source_feats = feature_cache[Path(row.path)].float()
-        else:
-            source_feats = get_full_features(row.path, wavlm, device)
-            source_feats = (source_feats * weights[:, None]).sum(
-                dim=0
-            )  # (seq_len, dim)
+            os.makedirs(target_path.parent, exist_ok=True)
+            feats.append(get_full_features(row.path, wavlm, device))
+            dump_paths.append(target_path)
 
-        pool = path2pools(row.path, wavlm, weights, device, ext)
+        # do the pre-matching if needed, when there are enough target feats
+        matched_feats = list()
+        if prematch:
+            for utt_idx in range(len(feats)):
+                source_feats = feats[utt_idx]
+                pool = [feats[idx] for idx in range(len(feats)) if idx != utt_idx]
+                if pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
+                    LOGGER.warning(
+                        f"Not enough target vectors for {dump_paths[utt_idx]}"
+                    )
+                    matched_feats.append(source_feats.cpu())
+                else:
+                    dists = fast_cosine_dist(source_feats.cpu(), pool.cpu()).cpu()
+                    best = dists.topk(k=topk, dim=-1, largest=False)
+                    matched_feats.append(pool[best.indices].mean(dim=1))
 
-        if not args.prematch or pool.shape[0] < MIN_VECTORS_FOR_PREMATCH:
-            out_feats = source_feats.cpu()
-        else:
-            dists = fast_cosine_dist(source_feats.cpu(), pool.cpu()).cpu()
-            best = dists.topk(k=args.topk, dim=-1, largest=False)  # (src_len, 4)
-            out_feats = pool[best.indices].mean(dim=1)  # (N, dim)
+            feats = matched_feats
 
-        # save matched sequence
-        if i < 3:
-            LOGGER.info("Feature has shape: ", out_feats.shape)
-
-        # 3. save
-        torch.save(out_feats.cpu().half(), str(targ_path))
-        if hasattr(pb, "child"):
-            pb.child.comment = str(rel_path)
-            pb.child.wait_for = min(pb.child.wait_for, 10)
-            pb.main_bar.comment = str(rel_path)
-        else:
-            pb.wait_for = min(pb.wait_for, 10)
-
-        pb.comment = str(rel_path)
-
-        if i % 1000 == 0:
-            LOGGER.info(f"Done {i:,d}/{len(df):,d}")
-            feature_cache.clear()
-            gc.collect()
-            time.sleep(4)
+        # dump the features and continue
+        for dump_path, dump_feats in zip(dump_paths, feats):
+            torch.save(dump_feats.cpu().half(), dump_path)
 
 
 if __name__ == "__main__":
