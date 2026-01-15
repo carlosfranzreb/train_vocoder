@@ -1,6 +1,6 @@
 {
     "resblock": "1",
-    "num_gpus": 0,
+    "num_gpus": 1,
     "batch_size": 16,
     "learning_rate": 0.0002,
     "adam_b1": 0.8,
@@ -18,7 +18,7 @@
     "hifi_dim": 512,
 
     "segment_size": 7040,
-    "num_mels": 80,
+    "num_mels": 1024,
     "num_freq": 1025,
     "n_fft": 1024,
     "hop_size": 320,
