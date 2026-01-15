@@ -60,7 +60,7 @@ def main(args):
 
 
 @torch.inference_mode()
-def get_full_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
+def get_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
     """
     Extracts WavLM features from the given audio path, and returns them as a single
     tensor of shape (n_feats, feat_dim).
@@ -73,10 +73,9 @@ def get_full_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
 
     # extract the representation of each layer
     x = x.to(device)
-    layer_results = wavlm.extract_features(
+    features = wavlm.extract_features(
         x, output_layer=wavlm.extract_from_layer, ret_layer_results=True
-    )[0][1]
-    features = torch.cat([f.squeeze() for f, _ in layer_results], dim=0)
+    )[0][1][-1][0].squeeze(1)
 
     return features
 
@@ -127,7 +126,7 @@ def extract(
                 target_path = None
 
             os.makedirs(target_path.parent, exist_ok=True)
-            feats.append(get_full_features(row.path, wavlm, device))
+            feats.append(get_features(row.path, wavlm, device))
             dump_paths.append(target_path)
 
         # do the pre-matching if needed, when there are enough target feats
