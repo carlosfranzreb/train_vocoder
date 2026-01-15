@@ -10,9 +10,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
-from fastprogress.fastprogress import progress_bar
 from torch import Tensor
+import torchaudio
+from tqdm import tqdm
 
 from hubconf import wavlm_large
 
@@ -149,9 +149,7 @@ def extract(
     ext: str,
 ):
 
-    pb = progress_bar(df.iterrows(), total=len(df))
-
-    for i, row in pb:
+    for i, row in tqdm(df.iterrows(), total=len(df)):
         rel_path = Path(row.path).relative_to(ls_path)
         targ_path = (out_path / rel_path).with_suffix(".pt")
         if args.resume:
@@ -204,10 +202,10 @@ if __name__ == "__main__":
         description="Compute matched wavlm features for a dataset"
     )
 
-    parser.add_argument("--path", required=True, type=str)
+    parser.add_argument("path", type=str)
+    parser.add_argument("out_path", type=str)
     parser.add_argument("--folder", action="append")
     parser.add_argument("--seed", default=123, type=int)
-    parser.add_argument("--out_path", required=True, type=str)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--ext", default=".flac", type=str)
     parser.add_argument("--topk", type=int, default=4)
