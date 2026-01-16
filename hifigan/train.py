@@ -14,12 +14,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from .meldataset import (
-    LogMelSpectrogram,
-    MelDataset,
-    get_dataset_filelist,
-    mel_spectrogram,
-)
+from .mel_utils import LogMelSpectrogram, mel_spectrogram
+from .ssl_dataset import get_dataset_filelist, SslDataset
 from .models import (
     Generator,
     MultiPeriodDiscriminator,
@@ -37,7 +33,6 @@ from .utils import (
 )
 
 torch.backends.cudnn.benchmark = True
-USE_ALT_MELCALC = True
 
 
 def train(rank, a, h):
@@ -113,7 +108,7 @@ def train(rank, a, h):
 
     train_df, valid_df = get_dataset_filelist(a)
 
-    trainset = MelDataset(
+    trainset = SslDataset(
         train_df,
         h.segment_size,
         h.n_fft,
@@ -127,10 +122,8 @@ def train(rank, a, h):
         shuffle=False if h.num_gpus > 1 else True,
         fmax_loss=h.fmax_for_loss,
         device=device,
-        fine_tuning=a.fine_tuning,
         audio_root_path=a.audio_root_path,
         feat_root_path=a.feature_root_path,
-        use_alt_melcalc=USE_ALT_MELCALC,
     )
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
@@ -146,12 +139,12 @@ def train(rank, a, h):
         drop_last=True,
     )
 
-    alt_melspec = LogMelSpectrogram(
+    melspec = LogMelSpectrogram(
         h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax
     ).to(device)
 
     if rank == 0:
-        validset = MelDataset(
+        validset = SslDataset(
             valid_df,
             h.segment_size,
             h.n_fft,
@@ -166,10 +159,8 @@ def train(rank, a, h):
             n_cache_reuse=0,
             fmax_loss=h.fmax_for_loss,
             device=device,
-            fine_tuning=a.fine_tuning,
             audio_root_path=a.audio_root_path,
             feat_root_path=a.feature_root_path,
-            use_alt_melcalc=USE_ALT_MELCALC,
         )
         validation_loader = DataLoader(
             validset,
@@ -212,19 +203,7 @@ def train(rank, a, h):
 
             with torch.amp.autocast(enabled=a.fp16, device_type=device):
                 y_g_hat = generator(x)
-                if USE_ALT_MELCALC:
-                    y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
-                else:
-                    y_g_hat_mel = mel_spectrogram(
-                        y_g_hat.squeeze(1),
-                        h.n_fft,
-                        h.num_mels,
-                        h.sampling_rate,
-                        h.hop_size,
-                        h.win_size,
-                        h.fmin,
-                        h.fmax_for_loss,
-                    )
+                y_g_hat_mel = melspec(y_g_hat.squeeze(1))
 
             optim_d.zero_grad()
 
@@ -334,26 +313,15 @@ def train(rank, a, h):
                             x, y, _, y_mel = batch
                             y_g_hat = generator(x.to(device))
                             y_mel = y_mel.to(device, non_blocking=True)
-                            if USE_ALT_MELCALC:
-                                y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
-                                if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
-                                    # pad it
-                                    n_pad = h.hop_size
-                                    y_g_hat = F.pad(
-                                        y_g_hat, (n_pad // 2, n_pad - n_pad // 2)
-                                    )
-                                    y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
-                            else:
-                                y_g_hat_mel = mel_spectrogram(
-                                    y_g_hat.squeeze(1),
-                                    h.n_fft,
-                                    h.num_mels,
-                                    h.sampling_rate,
-                                    h.hop_size,
-                                    h.win_size,
-                                    h.fmin,
-                                    h.fmax_for_loss,
+                            y_g_hat_mel = melspec(y_g_hat.squeeze(1))
+                            if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
+                                # pad it
+                                n_pad = h.hop_size
+                                y_g_hat = F.pad(
+                                    y_g_hat, (n_pad // 2, n_pad - n_pad // 2)
                                 )
+                                y_g_hat_mel = melspec(y_g_hat.squeeze(1))
+
                             # print('valid', x.shape, y_g_hat.shape, y_g_hat_mel.shape, y_mel.shape, y.shape)
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
@@ -372,19 +340,6 @@ def train(rank, a, h):
                                     steps,
                                     h.sampling_rate,
                                 )
-                                if USE_ALT_MELCALC:
-                                    y_hat_spec = alt_melspec(y_g_hat.squeeze(1))
-                                else:
-                                    y_hat_spec = mel_spectrogram(
-                                        y_g_hat.squeeze(1),
-                                        h.n_fft,
-                                        h.num_mels,
-                                        h.sampling_rate,
-                                        h.hop_size,
-                                        h.win_size,
-                                        h.fmin,
-                                        h.fmax_for_loss,
-                                    )
 
                         val_err = val_err_tot / (j + 1)
                         sw.add_scalar("validation/mel_spec_error", val_err, steps)
@@ -438,7 +393,6 @@ def main():
     parser.add_argument("--summary_interval", default=25, type=int)
     parser.add_argument("--validation_interval", default=1000, type=int)
     parser.add_argument("--fp16", default=False, type=bool)
-    parser.add_argument("--fine_tuning", action="store_true")
 
     a = parser.parse_args()
     print(a)
