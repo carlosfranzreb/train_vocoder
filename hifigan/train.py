@@ -7,12 +7,12 @@ import time
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from fastprogress import master_bar, progress_bar
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from .meldataset import (
     LogMelSpectrogram,
@@ -32,7 +32,6 @@ from .utils import (
     AttrDict,
     build_env,
     load_checkpoint,
-    plot_spectrogram,
     save_checkpoint,
     scan_checkpoint,
 )
@@ -50,8 +49,11 @@ def train(rank, a, h):
             rank=rank,
         )
 
-    torch.cuda.manual_seed(h.seed)
-    device = torch.device("cuda:{:d}".format(rank))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(h.seed)
+        device = torch.device("cuda:{:d}".format(rank))
+    else:
+        device = "cpu"
 
     generator = Generator(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
@@ -187,7 +189,7 @@ def train(rank, a, h):
     msd.train()
 
     if rank == 0:
-        mb = master_bar(range(max(0, last_epoch), a.training_epochs))
+        mb = tqdm(range(max(0, last_epoch), a.training_epochs))
     else:
         mb = range(max(0, last_epoch), a.training_epochs)
 
@@ -199,14 +201,7 @@ def train(rank, a, h):
         if h.num_gpus > 1:
             train_sampler.set_epoch(epoch)
 
-        if rank == 0:
-            pb = progress_bar(
-                enumerate(train_loader), total=len(train_loader), parent=mb
-            )
-        else:
-            pb = enumerate(train_loader)
-
-        for i, batch in pb:
+        for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
             x, y, _, y_mel = batch
@@ -215,7 +210,7 @@ def train(rank, a, h):
             y_mel = y_mel.to(device, non_blocking=True)
             y = y.unsqueeze(1)
 
-            with torch.cuda.amp.autocast(enabled=a.fp16):
+            with torch.amp.autocast(enabled=a.fp16, device_type=device):
                 y_g_hat = generator(x)
                 if USE_ALT_MELCALC:
                     y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
@@ -230,10 +225,10 @@ def train(rank, a, h):
                         h.fmin,
                         h.fmax_for_loss,
                     )
-            # print(x.shape, y_g_hat.shape, y_g_hat_mel.shape, y_mel.shape, y.shape)
+
             optim_d.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=a.fp16):
+            with torch.amp.autocast(enabled=a.fp16, device_type=device):
                 # MPD
                 y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
                 loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(
@@ -259,7 +254,7 @@ def train(rank, a, h):
             # Generator
             optim_g.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=a.fp16):
+            with torch.amp.autocast(enabled=a.fp16, device_type=device):
                 # L1 Mel-Spectrogram Loss
                 loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
@@ -295,9 +290,6 @@ def train(rank, a, h):
                             time.time() - start_b,
                             torch.cuda.max_memory_allocated() / 1e9,
                         )
-                    )
-                    mb.child.comment = "Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}".format(
-                        steps, loss_gen_all, mel_error
                     )
 
                 # checkpointing
@@ -336,10 +328,8 @@ def train(rank, a, h):
                     torch.cuda.empty_cache()
                     val_err_tot = 0
                     with torch.no_grad():
-                        for j, batch in progress_bar(
-                            enumerate(validation_loader),
-                            total=len(validation_loader),
-                            parent=mb,
+                        for j, batch in tqdm(
+                            enumerate(validation_loader), total=len(validation_loader)
                         ):
                             x, y, _, y_mel = batch
                             y_g_hat = generator(x.to(device))
@@ -375,11 +365,6 @@ def train(rank, a, h):
                                         steps,
                                         h.sampling_rate,
                                     )
-                                    sw.add_figure(
-                                        "gt/y_spec_{}".format(j),
-                                        plot_spectrogram(x[0]),
-                                        steps,
-                                    )
 
                                 sw.add_audio(
                                     "generated/y_hat_{}".format(j),
@@ -401,14 +386,6 @@ def train(rank, a, h):
                                         h.fmax_for_loss,
                                     )
 
-                                sw.add_figure(
-                                    "generated/y_hat_spec_{}".format(j),
-                                    plot_spectrogram(
-                                        y_hat_spec.squeeze(0).cpu().numpy()
-                                    ),
-                                    steps,
-                                )
-
                         val_err = val_err_tot / (j + 1)
                         sw.add_scalar("validation/mel_spec_error", val_err, steps)
                         mb.write(
@@ -426,8 +403,9 @@ def train(rank, a, h):
                         torch.cuda.max_memory_reserved() / 1e9,
                         steps,
                     )
-                    torch.cuda.reset_peak_memory_stats()
-                    torch.cuda.reset_accumulated_memory_stats()
+                    if "cuda" in device:
+                        torch.cuda.reset_peak_memory_stats()
+                        torch.cuda.reset_accumulated_memory_stats()
 
             steps += 1
 
@@ -447,15 +425,13 @@ def main():
 
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("input_training_file")
+    parser.add_argument("input_validation_file")
+    parser.add_argument("audio_root_path")
+    parser.add_argument("feature_root_path")
+    parser.add_argument("config")
     parser.add_argument("--group_name", default=None)
-    parser.add_argument("--audio_root_path", required=True)
-    parser.add_argument("--feature_root_path", required=True)
-    parser.add_argument("--input_training_file", default="LJSpeech-1.1/training.txt")
-    parser.add_argument(
-        "--input_validation_file", default="LJSpeech-1.1/validation.txt"
-    )
     parser.add_argument("--checkpoint_path", default="cp_hifigan")
-    parser.add_argument("--config", default="")
     parser.add_argument("--training_epochs", default=1500, type=int)
     parser.add_argument("--stdout_interval", default=5, type=int)
     parser.add_argument("--checkpoint_interval", default=5000, type=int)
@@ -480,7 +456,8 @@ def main():
         h.batch_size = int(h.batch_size / h.num_gpus)
         print("Batch size per GPU :", h.batch_size)
     else:
-        pass
+        print("Batch size set to 1 for CPU")
+        h.batch_size = 1
 
     if h.num_gpus > 1:
         mp.spawn(
