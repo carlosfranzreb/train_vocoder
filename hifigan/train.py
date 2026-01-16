@@ -3,6 +3,7 @@ import itertools
 import json
 import os
 import time
+import logging
 
 import torch
 import torch.multiprocessing as mp
@@ -34,6 +35,15 @@ from .utils import (
 
 torch.backends.cudnn.benchmark = True
 
+# create logger
+LOGGER = logging.getLogger("train")
+handler = logging.FileHandler("train.log")
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
+
 
 def train(rank, a, h):
     if h.num_gpus > 1:
@@ -55,9 +65,9 @@ def train(rank, a, h):
     msd = MultiScaleDiscriminator().to(device)
 
     if rank == 0:
-        print(generator)
+        LOGGER.info(generator)
         os.makedirs(a.checkpoint_path, exist_ok=True)
-        print("checkpoints directory : ", a.checkpoint_path)
+        LOGGER.info("checkpoints directory : ", a.checkpoint_path)
 
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, "g_")
@@ -75,10 +85,10 @@ def train(rank, a, h):
         msd.load_state_dict(state_dict_do["msd"])
         steps = state_dict_do["steps"] + 1
         last_epoch = state_dict_do["epoch"]
-        print(f"Restored checkpoint from {cp_g} and {cp_do}")
+        LOGGER.info(f"Restored checkpoint from {cp_g} and {cp_do}")
 
     if h.num_gpus > 1:
-        print("Multi-gpu detected")
+        LOGGER.info("Multi-gpu detected")
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
         msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
@@ -322,7 +332,6 @@ def train(rank, a, h):
                                 )
                                 y_g_hat_mel = melspec(y_g_hat.squeeze(1))
 
-                            # print('valid', x.shape, y_g_hat.shape, y_g_hat_mel.shape, y_mel.shape, y.shape)
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                             if j <= 4:
@@ -368,7 +377,7 @@ def train(rank, a, h):
         scheduler_d.step()
 
         if rank == 0:
-            print(
+            LOGGER.info(
                 "Time taken for epoch {} is {} sec\n".format(
                     epoch + 1, int(time.time() - start)
                 )
@@ -376,7 +385,7 @@ def train(rank, a, h):
 
 
 def main():
-    print("Initializing Training Process..")
+    LOGGER.info("Initializing Training Process..")
 
     parser = argparse.ArgumentParser()
 
@@ -395,7 +404,7 @@ def main():
     parser.add_argument("--fp16", default=False, type=bool)
 
     a = parser.parse_args()
-    print(a)
+    LOGGER.info(a)
     with open(a.config) as f:
         data = f.read()
 
@@ -408,9 +417,9 @@ def main():
         torch.cuda.manual_seed(h.seed)
         h.num_gpus = torch.cuda.device_count()
         h.batch_size = int(h.batch_size / h.num_gpus)
-        print("Batch size per GPU :", h.batch_size)
+        LOGGER.info("Batch size per GPU :", h.batch_size)
     else:
-        print("Batch size set to 1 for CPU")
+        LOGGER.info("Batch size set to 1 for CPU")
         h.batch_size = 1
 
     if h.num_gpus > 1:
