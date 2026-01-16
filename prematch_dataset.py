@@ -1,7 +1,23 @@
 """
-If torchcodec, cannot find ffmpeg: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+! If torchcodec cannot find ffmpeg: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
 
-TODO:
+This script extracts and pre-matches WavLM audio features from a dataset of utterances.
+
+Pre-matching refers to a kNN regression across utterances from the same speaker to
+create matched feature pairs, similar to those you would get from a real conversion
+step on inference. Given a speaker's utterances, `prematch_feats`, for each utterance,
+
+- finds the k nearest features from all *other* utterances of the same speaker
+- Averages those k nearest neighbors to create a matched representation
+
+For speakers with a lot of data, the data is split into chunks to avoid memory issues
+while maintaining independent pre-matching within chunks. You can define how to chunk
+the speaker's data with MAX_VECTORS_FOR_PREMATCH.
+
+With MIN_VECTORS_FOR_PREMATCH, you can define a lower bound for the amount of data
+required for pre-matching. Utterances for which the matching pool is lower than this
+threshold are not pre-matched, and stored as-is.
+
 """
 
 import argparse
@@ -22,10 +38,16 @@ from wavlm import init_wavlm_large
 
 DOWNSAMPLE_FACTOR = 320
 MIN_VECTORS_FOR_PREMATCH = 9000  # 3 minutes
-LOGGER = logging.getLogger("prematch_dataset.log")
+MAX_VECTORS_FOR_PREMATCH = 24000  # 8 minutes
 
-global feature_cache
-feature_cache = {}
+# create logger
+LOGGER = logging.getLogger("prematch_dataset")
+handler = logging.FileHandler("prematch_dataset.log")
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
 
 
 def make_df(root_path: Path, ext: str = ".flac") -> pd.DataFrame:
@@ -40,6 +62,7 @@ def make_df(root_path: Path, ext: str = ".flac") -> pd.DataFrame:
 
 
 def main(args):
+    LOGGER.info(f"Starting run with args {args}")
     df = make_df(Path(args.path), ext=args.ext)
 
     LOGGER.info(f"Loading wavlm.")
@@ -132,7 +155,36 @@ def extract(
             dump_paths.append(target_path)
 
         if prematch:
-            feats = prematch_feats(feats, topk, dump_paths, resume)
+            # split data if there is enough for at least 2 disjoint parts
+            feat_lens = torch.tensor([f.shape[0] for f in feats])
+            sum_feats = torch.sum(feat_lens)
+            if sum_feats > MAX_VECTORS_FOR_PREMATCH * 2:
+
+                # find where to split
+                n_splits = sum_feats // MAX_VECTORS_FOR_PREMATCH
+                chunk_size = sum_feats // n_splits
+                cumsum_feats = torch.cumsum(feat_lens, dim=0)
+
+                # prematch each chunk
+                feats_prematched = list()
+                start_idx = 0
+                for split_number in range(n_splits):
+                    if split_number == n_splits - 1:
+                        split_idx = len(feats)
+                    else:
+                        split_max = chunk_size * (split_number + 1)
+                        split_idx = torch.argwhere(cumsum_feats > split_max)[0]
+
+                    chunk = feats[start_idx:split_idx]
+                    feats_prematched.extend(
+                        prematch_feats(chunk, topk, dump_paths, resume)
+                    )
+                    start_idx = split_idx
+
+                feats = feats_prematched
+
+            else:
+                feats = prematch_feats(feats, topk, dump_paths, resume)
 
         # dump the features and continue
         for dump_path, dump_feats in zip(dump_paths, feats):
@@ -144,7 +196,7 @@ def prematch_feats(
 ) -> list[Tensor]:
     """
     Given the WavLM features of several utterances of the same speaker, pre-match
-    them by doing a kNN regression where the utteance being regressed is removed
+    them by doing a kNN regression where the utterance being regressed is removed
     from the pool.
     """
 
@@ -153,8 +205,7 @@ def prematch_feats(
     n_utts = len(feats)
 
     # Pre-calculate offsets to avoid repeated masking
-    feat_lens = [f.shape[0] for f in feats]
-    offsets = torch.cumsum([0] + feat_lens)
+    offsets = torch.cumsum(torch.tensor([0] + [f.shape[0] for f in feats]), dim=0)
 
     utts = torch.hstack(
         [
