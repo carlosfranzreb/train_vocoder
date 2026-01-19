@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from line_profiler import profile
 
 from .mel_utils import LogMelSpectrogram, mel_spectrogram
 from .ssl_dataset import get_dataset_filelist, SslDataset
@@ -45,6 +46,7 @@ LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
 
 
+@profile
 def train(rank, a, h):
     if h.num_gpus > 1:
         init_process_group(
@@ -56,16 +58,16 @@ def train(rank, a, h):
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed(h.seed)
-        device = torch.device("cuda:{:d}".format(rank))
+        device = "cuda:{:d}".format(rank)
     else:
         device = "cpu"
-
+    
+    LOGGER.info(f"Device: {device}")
     generator = Generator(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
     if rank == 0:
-        LOGGER.info(generator)
         os.makedirs(a.checkpoint_path, exist_ok=True)
         LOGGER.info("checkpoints directory : ", a.checkpoint_path)
 
@@ -317,9 +319,7 @@ def train(rank, a, h):
                     torch.cuda.empty_cache()
                     val_err_tot = 0
                     with torch.no_grad():
-                        for j, batch in tqdm(
-                            enumerate(validation_loader), total=len(validation_loader)
-                        ):
+                        for j, batch in enumerate(validation_loader):
                             x, y, _, y_mel = batch
                             y_g_hat = generator(x.to(device))
                             y_mel = y_mel.to(device, non_blocking=True)
@@ -378,7 +378,7 @@ def train(rank, a, h):
 
         if rank == 0:
             LOGGER.info(
-                "Time taken for epoch {} is {} sec\n".format(
+                "Time taken for epoch {} is {} sec".format(
                     epoch + 1, int(time.time() - start)
                 )
             )
@@ -394,13 +394,12 @@ def main():
     parser.add_argument("audio_root_path")
     parser.add_argument("feature_root_path")
     parser.add_argument("config")
-    parser.add_argument("--group_name", default=None)
-    parser.add_argument("--checkpoint_path", default="cp_hifigan")
-    parser.add_argument("--training_epochs", default=1500, type=int)
+    parser.add_argument("--checkpoint_dir", default="cp_hifigan")
+    parser.add_argument("--training_epochs", default=1800, type=int)
     parser.add_argument("--stdout_interval", default=5, type=int)
     parser.add_argument("--checkpoint_interval", default=5000, type=int)
     parser.add_argument("--summary_interval", default=25, type=int)
-    parser.add_argument("--validation_interval", default=1000, type=int)
+    parser.add_argument("--validation_interval", default=5000, type=int)
     parser.add_argument("--fp16", default=False, type=bool)
 
     a = parser.parse_args()
@@ -410,6 +409,7 @@ def main():
 
     json_config = json.loads(data)
     h = AttrDict(json_config)
+    a.checkpoint_path = os.path.join(a.checkpoint_dir, str(int(time.time())))
     build_env(a.config, "config.json", a.checkpoint_path)
 
     torch.manual_seed(h.seed)
