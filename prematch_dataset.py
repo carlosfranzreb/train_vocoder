@@ -258,7 +258,7 @@ if __name__ == "__main__":
     parser.add_argument("--ext", default=".flac", type=str)
     parser.add_argument("--topk", type=int, default=4)
     parser.add_argument("--layer", type=int, default=6)
-    parser.add_argument("--prematch", action="store_true", help="prematch")
+    parser.add_argument("--prematch", action="store_true")
     parser.add_argument("--resume", action="store_true")
 
     args = parser.parse_args()
