@@ -1,6 +1,5 @@
 import argparse
 import itertools
-import json
 import os
 import time
 import logging
@@ -8,7 +7,7 @@ import subprocess
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -96,9 +95,8 @@ def train(config: AttrDict, logger: logging.Logger):
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
         optim_d, gamma=config.adamw.lr_decay, last_epoch=last_epoch
     )
-    if config.fp16:
-        scaler_g = GradScaler()
-        scaler_d = GradScaler()
+    scaler_g = GradScaler(device, enabled=config.fp16)
+    scaler_d = GradScaler(device, enabled=config.fp16)
 
     train_df, valid_df = get_dataset_filelist(config)
 
@@ -188,13 +186,9 @@ def train(config: AttrDict, logger: logging.Logger):
 
                 loss_disc_all = loss_disc_s + loss_disc_f
 
-            if config.fp16:
-                scaler_d.scale(loss_disc_all).backward()
-                scaler_d.step(optim_d)
-                scaler_d.update()
-            else:
-                loss_disc_all.backward()
-                optim_d.step()
+            scaler_d.scale(loss_disc_all).backward()
+            scaler_d.step(optim_d)
+            scaler_d.update()
 
             # Generator
             optim_g.zero_grad()
@@ -213,13 +207,9 @@ def train(config: AttrDict, logger: logging.Logger):
                     loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
                 )
 
-            if config.fp16:
-                scaler_g.scale(loss_gen_all).backward()
-                scaler_g.step(optim_g)
-                scaler_g.update()
-            else:
-                loss_gen_all.backward()
-                optim_g.step()
+            scaler_g.scale(loss_gen_all).backward()
+            scaler_g.step(optim_g)
+            scaler_g.update()
 
             # STDOUT logging
             if steps % config.stdout_interval == 0:
