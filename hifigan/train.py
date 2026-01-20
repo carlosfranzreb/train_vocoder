@@ -22,13 +22,7 @@ from .models import (
     feature_loss,
     generator_loss,
 )
-from .utils import (
-    AttrDict,
-    build_env,
-    load_checkpoint,
-    save_checkpoint,
-    scan_checkpoint,
-)
+from .utils import AttrDict, load_checkpoint, save_checkpoint, scan_checkpoint
 
 torch.backends.cudnn.benchmark = True
 
@@ -47,7 +41,7 @@ def create_dataloader(
     )
 
 
-def train(args, config, logger, device):
+def train(config: AttrDict, logger: logging.Logger, device: str):
 
     # init models
     logger.info(f"Device: {device}")
@@ -56,11 +50,11 @@ def train(args, config, logger, device):
     msd = MultiScaleDiscriminator().to(device)
 
     # check if ckpt folder already exists and retrieve checkpoints
-    os.makedirs(args.checkpoint_path, exist_ok=True)
-    logger.info("checkpoints directory : ", args.checkpoint_path)
-    if os.path.isdir(args.checkpoint_path):
-        cp_g = scan_checkpoint(args.checkpoint_path, "g_")
-        cp_do = scan_checkpoint(args.checkpoint_path, "do_")
+    os.makedirs(config.checkpoint_path, exist_ok=True)
+    logger.info("checkpoints directory : ", config.checkpoint_path)
+    if os.path.isdir(config.checkpoint_path):
+        cp_g = scan_checkpoint(config.checkpoint_path, "g_")
+        cp_do = scan_checkpoint(config.checkpoint_path, "do_")
 
     # if ckpt folder is new, start training from scratch
     if cp_g is None or cp_do is None:
@@ -100,11 +94,11 @@ def train(args, config, logger, device):
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
         optim_d, gamma=config.lr_decay, last_epoch=last_epoch
     )
-    if args.fp16:
+    if config.fp16:
         scaler_g = GradScaler()
         scaler_d = GradScaler()
 
-    train_df, valid_df = get_dataset_filelist(args)
+    train_df, valid_df = get_dataset_filelist(config)
 
     trainset = SslDataset(
         train_df,
@@ -120,8 +114,8 @@ def train(args, config, logger, device):
         shuffle=True,
         fmax_loss=config.fmax_for_loss,
         device=device,
-        audio_root_path=args.audio_root_path,
-        feat_root_path=args.feature_root_path,
+        audio_root_path=config.audio_root_path,
+        feat_root_path=config.feature_root_path,
     )
     train_loader = create_dataloader(trainset, config)
 
@@ -150,17 +144,17 @@ def train(args, config, logger, device):
         n_cache_reuse=0,
         fmax_loss=config.fmax_for_loss,
         device=device,
-        audio_root_path=args.audio_root_path,
-        feat_root_path=args.feature_root_path,
+        audio_root_path=config.audio_root_path,
+        feat_root_path=config.feature_root_path,
     )
     validation_loader = create_dataloader(validset, config, shuffle=False)
 
-    sw = SummaryWriter(args.checkpoint_path)
+    sw = SummaryWriter(config.checkpoint_path)
     generator.train()
     mpd.train()
     msd.train()
 
-    for epoch in tqdm(range(max(0, last_epoch), args.training_epochs)):
+    for epoch in tqdm(range(max(0, last_epoch), config.training_epochs)):
         start = time.time()
 
         for i, batch in enumerate(train_loader):
@@ -171,13 +165,13 @@ def train(args, config, logger, device):
             y_mel = y_mel.to(device, non_blocking=True)
             y = y.unsqueeze(1)
 
-            with torch.amp.autocast(enabled=args.fp16, device_type=device):
+            with torch.amp.autocast(enabled=config.fp16, device_type=device):
                 y_g_hat = generator(x)
                 y_g_hat_mel = melspec(y_g_hat.squeeze(1))
 
             optim_d.zero_grad()
 
-            with torch.amp.autocast(enabled=args.fp16, device_type=device):
+            with torch.amp.autocast(enabled=config.fp16, device_type=device):
                 # MPD
                 y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
                 loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(
@@ -192,7 +186,7 @@ def train(args, config, logger, device):
 
                 loss_disc_all = loss_disc_s + loss_disc_f
 
-            if args.fp16:
+            if config.fp16:
                 scaler_d.scale(loss_disc_all).backward()
                 scaler_d.step(optim_d)
                 scaler_d.update()
@@ -203,7 +197,7 @@ def train(args, config, logger, device):
             # Generator
             optim_g.zero_grad()
 
-            with torch.amp.autocast(enabled=args.fp16, device_type=device):
+            with torch.amp.autocast(enabled=config.fp16, device_type=device):
                 # L1 Mel-Spectrogram Loss
                 loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
@@ -217,7 +211,7 @@ def train(args, config, logger, device):
                     loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
                 )
 
-            if args.fp16:
+            if config.fp16:
                 scaler_g.scale(loss_gen_all).backward()
                 scaler_g.step(optim_g)
                 scaler_g.update()
@@ -226,7 +220,7 @@ def train(args, config, logger, device):
                 optim_g.step()
 
             # STDOUT logging
-            if steps % args.stdout_interval == 0:
+            if steps % config.stdout_interval == 0:
                 with torch.no_grad():
                     mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
 
@@ -241,13 +235,15 @@ def train(args, config, logger, device):
                 )
 
             # checkpointing
-            if steps % args.checkpoint_interval == 0 and steps != 0:
-                checkpoint_path = "{}/g_{:08d}.pt".format(args.checkpoint_path, steps)
+            if steps % config.checkpoint_interval == 0 and steps != 0:
+                checkpoint_path = "{}/g_{:08d}.pt".format(config.checkpoint_path, steps)
                 save_checkpoint(
                     checkpoint_path,
                     {"generator": (generator).state_dict()},
                 )
-                checkpoint_path = "{}/do_{:08d}.pt".format(args.checkpoint_path, steps)
+                checkpoint_path = "{}/do_{:08d}.pt".format(
+                    config.checkpoint_path, steps
+                )
                 save_checkpoint(
                     checkpoint_path,
                     {
@@ -261,13 +257,13 @@ def train(args, config, logger, device):
                 )
 
             # Tensorboard summary logging
-            if steps % args.summary_interval == 0:
+            if steps % config.summary_interval == 0:
                 sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
                 sw.add_scalar("training/mel_spec_error", mel_error, steps)
                 sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
 
             # Validation
-            if steps % args.validation_interval == 0:
+            if steps % config.validation_interval == 0:
                 generator.eval()
                 torch.cuda.empty_cache()
                 val_err_tot = 0
@@ -353,7 +349,6 @@ def main():
 
     # load args
     args = parser.parse_args()
-    logger.info(args)
     with open(args.config) as f:
         data = f.read()
 
@@ -361,7 +356,14 @@ def main():
     json_config = json.loads(data)
     config = AttrDict(json_config)
     args.checkpoint_path = os.path.join(args.checkpoint_dir, str(int(time.time())))
-    build_env(args.config, "config.json", args.checkpoint_path)
+
+    # add args to config
+    for key, value in vars(args).items():
+        config[key] = value
+
+    # dump config
+    os.makedirs(args.checkpoint_path)
+    json.dump(config, open(os.path.join(args.checkpoint_path, "config.json")))
 
     # create logger
     logger = logging.getLogger("train")
@@ -385,7 +387,7 @@ def main():
         config.batch_size = 1
         device = "cpu"
 
-    train(args, config, logger, device)
+    train(config, logger, device)
 
 
 if __name__ == "__main__":
