@@ -12,6 +12,7 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from omegaconf import DictConfig, OmegaConf
 
 from .mel_utils import LogMelSpectrogram
 from .ssl_dataset import get_dataset_filelist, SslDataset
@@ -29,7 +30,7 @@ torch.backends.cudnn.benchmark = True
 
 
 def create_dataloader(
-    dataset: Dataset, config: AttrDict, shuffle: bool = True
+    dataset: Dataset, config: DictConfig, shuffle: bool = True
 ) -> DataLoader:
     return DataLoader(
         dataset,
@@ -42,11 +43,11 @@ def create_dataloader(
     )
 
 
-def train(config: AttrDict, logger: logging.Logger, device: str):
+def train(config: AttrDict, logger: logging.Logger):
 
     # init models
-    logger.info(f"Device: {device}")
-    generator = Generator(config).to(device)
+    device = config.device
+    generator = Generator(config.hifigan).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
@@ -76,13 +77,13 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
 
     optim_g = torch.optim.AdamW(
         generator.parameters(),
-        config.learning_rate,
-        betas=[config.adam_b1, config.adam_b2],
+        config.adamw.learning_rate,
+        betas=[config.adamw.adam_b1, config.adamw.adam_b2],
     )
     optim_d = torch.optim.AdamW(
         itertools.chain(msd.parameters(), mpd.parameters()),
-        config.learning_rate,
-        betas=[config.adam_b1, config.adam_b2],
+        config.adamw.learning_rate,
+        betas=[config.adamw.adam_b1, config.adamw.adam_b2],
     )
 
     if state_dict_do is not None:
@@ -90,10 +91,10 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
         optim_d.load_state_dict(state_dict_do["optim_d"])
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=config.lr_decay, last_epoch=last_epoch
+        optim_g, gamma=config.adamw.lr_decay, last_epoch=last_epoch
     )
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=config.lr_decay, last_epoch=last_epoch
+        optim_d, gamma=config.adamw.lr_decay, last_epoch=last_epoch
     )
     if config.fp16:
         scaler_g = GradScaler()
@@ -103,17 +104,17 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
 
     trainset = SslDataset(
         train_df,
-        config.segment_size,
-        config.n_fft,
-        config.num_mels,
-        config.hop_size,
-        config.win_size,
+        config.mel.segment_size,
+        config.mel.n_fft,
+        config.mel.num_mels,
+        config.mel.hop_size,
+        config.mel.win_size,
         config.sampling_rate,
-        config.fmin,
-        config.fmax,
+        config.mel.fmin,
+        config.mel.fmax,
         n_cache_reuse=0,
         shuffle=True,
-        fmax_loss=config.fmax_for_loss,
+        fmax_loss=config.mel.fmax_for_loss,
         device=device,
         audio_root_path=config.audio_root_path,
         feat_root_path=config.feature_root_path,
@@ -121,29 +122,29 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
     train_loader = create_dataloader(trainset, config)
 
     melspec = LogMelSpectrogram(
-        config.n_fft,
-        config.num_mels,
+        config.mel.n_fft,
+        config.mel.num_mels,
         config.sampling_rate,
-        config.hop_size,
-        config.win_size,
-        config.fmin,
-        config.fmax,
+        config.mel.hop_size,
+        config.mel.win_size,
+        config.mel.fmin,
+        config.mel.fmax,
     ).to(device)
 
     validset = SslDataset(
         valid_df,
-        config.segment_size,
-        config.n_fft,
-        config.num_mels,
-        config.hop_size,
-        config.win_size,
+        config.mel.segment_size,
+        config.mel.n_fft,
+        config.mel.num_mels,
+        config.mel.hop_size,
+        config.mel.win_size,
         config.sampling_rate,
-        config.fmin,
-        config.fmax,
+        config.mel.fmin,
+        config.mel.fmax,
         False,
         False,
         n_cache_reuse=0,
-        fmax_loss=config.fmax_for_loss,
+        fmax_loss=config.mel.fmax_for_loss,
         device=device,
         audio_root_path=config.audio_root_path,
         feat_root_path=config.feature_root_path,
@@ -158,7 +159,7 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
     for epoch in tqdm(range(max(0, last_epoch), config.training_epochs)):
         start = time.time()
 
-        for i, batch in enumerate(train_loader):
+        for batch in train_loader:
             start_b = time.time()
             x, y, _, y_mel = batch
             x = x.to(device, non_blocking=True)
@@ -329,31 +330,65 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
         )
 
 
+def override_with_args(config: DictConfig, args: dict):
+    """
+    Update the config with the passed arguments. The new value is casted to the type of
+    the existing value. If that fails, an error is raised.
+    """
+
+    def check_key_existence(config: DictConfig, key: str, full_key: str):
+        """Raise an error if the key does not exist in the cofig."""
+        if key not in config:
+            raise KeyError(
+                f"Subkey '{key}' not found in config for override '{full_key}'"
+            )
+
+    if len(args) % 2 != 0:
+        raise RuntimeError(
+            "The number of config arguments must be even (key-value pairs)"
+        )
+
+    # cast args to a dict
+    args_dict = dict()
+    for key_idx in range(0, len(args), 2):
+        args_dict[args[key_idx]] = args[key_idx + 1]
+
+    for key, value in args_dict.items():
+        keys = key.split(".")
+
+        # iterate over the keys that serve as directories
+        sub_config = config
+        for sub_key in keys[:-1]:
+            check_key_existence(sub_config, sub_key, key)
+            sub_config = sub_config[sub_key]
+
+        # change the value of the last key
+        last_key = keys[-1]
+        check_key_existence(sub_config, last_key, key)
+        if type(sub_config[last_key]) is not type(value):
+            old_type = type(sub_config[last_key])
+            try:
+                value = old_type(value)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to cast override for '{key}' to {old_type}: {e}"
+                )
+        sub_config[last_key] = value
+
+
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_training_file")
-    parser.add_argument("input_validation_file")
-    parser.add_argument("audio_root_path")
-    parser.add_argument("feature_root_path")
     parser.add_argument("config")
-    parser.add_argument("--checkpoint_dir", default="cp_hifigan")
-    parser.add_argument("--training_epochs", default=1800, type=int)
-    parser.add_argument("--stdout_interval", default=5, type=int)
-    parser.add_argument("--checkpoint_interval", default=5000, type=int)
-    parser.add_argument("--summary_interval", default=25, type=int)
-    parser.add_argument("--validation_interval", default=5000, type=int)
-    parser.add_argument("--fp16", default=False, type=bool)
 
-    # load args
-    args = parser.parse_args()
-    with open(args.config) as f:
-        data = f.read()
+    # load args and config overrides
+    args, config_overrides = parser.parse_known_args()
+    config = OmegaConf.load(args.config)
+    override_with_args(config, config_overrides)
 
     # define logging directory
-    json_config = json.loads(data)
-    config = AttrDict(json_config)
-    args.ckpt_path = os.path.join(args.checkpoint_dir, str(int(time.time())))
+    config.ckpt_path = os.path.join(config.checkpoint_dir, str(int(time.time())))
+    os.makedirs(config.ckpt_path)
 
     # add args to config
     for key, value in vars(args).items():
@@ -365,12 +400,11 @@ def main():
         .decode("ascii")
         .strip()
     )
-    os.makedirs(args.ckpt_path)
-    json.dump(config, open(os.path.join(args.ckpt_path, "config.json")))
+    OmegaConf.save(config, os.path.join(config.ckpt_path, "config.yaml"))
 
     # create logger
     logger = logging.getLogger("train")
-    handler = logging.FileHandler(os.path.join(args.ckpt_path, "train.log"))
+    handler = logging.FileHandler(os.path.join(config.ckpt_path, "train.log"))
     handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -384,13 +418,13 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
         logger.info("Batch size:", config.batch_size)
-        device = "cuda"
+        config.device = "cuda"
     else:
         logger.info("Batch size set to 1 for CPU")
         config.batch_size = 1
-        device = "cpu"
+        config.device = "cpu"
 
-    train(config, logger, device)
+    train(config, logger)
 
 
 if __name__ == "__main__":
