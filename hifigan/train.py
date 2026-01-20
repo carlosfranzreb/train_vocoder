@@ -14,9 +14,8 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from line_profiler import profile
 
-from .mel_utils import LogMelSpectrogram, mel_spectrogram
+from .mel_utils import LogMelSpectrogram
 from .ssl_dataset import get_dataset_filelist, SslDataset
 from .models import (
     Generator,
@@ -46,39 +45,33 @@ LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
 
 
-@profile
-def train(rank, a, h):
-    if h.num_gpus > 1:
-        init_process_group(
-            backend=h.dist_config["dist_backend"],
-            init_method=h.dist_config["dist_url"],
-            world_size=h.dist_config["world_size"] * h.num_gpus,
-            rank=rank,
-        )
-
+def train(a, h):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(h.seed)
-        device = "cuda:{:d}".format(rank)
+        device = "cuda"
     else:
         device = "cpu"
-    
+
+    # init models
     LOGGER.info(f"Device: {device}")
     generator = Generator(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
-    if rank == 0:
-        os.makedirs(a.checkpoint_path, exist_ok=True)
-        LOGGER.info("checkpoints directory : ", a.checkpoint_path)
-
+    # check if ckpt folder already exists and retrieve checkpoints
+    os.makedirs(a.checkpoint_path, exist_ok=True)
+    LOGGER.info("checkpoints directory : ", a.checkpoint_path)
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, "g_")
         cp_do = scan_checkpoint(a.checkpoint_path, "do_")
 
-    steps = 0
+    # if ckpt folder is new, start training from scratch
     if cp_g is None or cp_do is None:
+        steps = 0
         state_dict_do = None
         last_epoch = -1
+
+    # otherwise, resume training from ckpt
     else:
         state_dict_g = load_checkpoint(cp_g, device)
         state_dict_do = load_checkpoint(cp_do, device)
@@ -88,12 +81,6 @@ def train(rank, a, h):
         steps = state_dict_do["steps"] + 1
         last_epoch = state_dict_do["epoch"]
         LOGGER.info(f"Restored checkpoint from {cp_g} and {cp_do}")
-
-    if h.num_gpus > 1:
-        LOGGER.info("Multi-gpu detected")
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
-        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
 
     optim_g = torch.optim.AdamW(
         generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2]
@@ -131,20 +118,17 @@ def train(rank, a, h):
         h.fmin,
         h.fmax,
         n_cache_reuse=0,
-        shuffle=False if h.num_gpus > 1 else True,
+        shuffle=True,
         fmax_loss=h.fmax_for_loss,
         device=device,
         audio_root_path=a.audio_root_path,
         feat_root_path=a.feature_root_path,
     )
 
-    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
-
     train_loader = DataLoader(
         trainset,
         num_workers=h.num_workers,
         shuffle=False,
-        sampler=train_sampler,
         batch_size=h.batch_size,
         pin_memory=True,
         persistent_workers=True,
@@ -155,58 +139,45 @@ def train(rank, a, h):
         h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax
     ).to(device)
 
-    if rank == 0:
-        validset = SslDataset(
-            valid_df,
-            h.segment_size,
-            h.n_fft,
-            h.num_mels,
-            h.hop_size,
-            h.win_size,
-            h.sampling_rate,
-            h.fmin,
-            h.fmax,
-            False,
-            False,
-            n_cache_reuse=0,
-            fmax_loss=h.fmax_for_loss,
-            device=device,
-            audio_root_path=a.audio_root_path,
-            feat_root_path=a.feature_root_path,
-        )
-        validation_loader = DataLoader(
-            validset,
-            num_workers=1,
-            shuffle=False,
-            sampler=None,
-            batch_size=1,
-            pin_memory=True,
-            persistent_workers=True,
-            drop_last=True,
-        )
+    validset = SslDataset(
+        valid_df,
+        h.segment_size,
+        h.n_fft,
+        h.num_mels,
+        h.hop_size,
+        h.win_size,
+        h.sampling_rate,
+        h.fmin,
+        h.fmax,
+        False,
+        False,
+        n_cache_reuse=0,
+        fmax_loss=h.fmax_for_loss,
+        device=device,
+        audio_root_path=a.audio_root_path,
+        feat_root_path=a.feature_root_path,
+    )
+    validation_loader = DataLoader(
+        validset,
+        num_workers=1,
+        shuffle=False,
+        batch_size=1,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True,
+    )
 
-        sw = SummaryWriter(os.path.join(a.checkpoint_path, "logs"))
+    sw = SummaryWriter(os.path.join(a.checkpoint_path, "logs"))
 
     generator.train()
     mpd.train()
     msd.train()
 
-    if rank == 0:
-        mb = tqdm(range(max(0, last_epoch), a.training_epochs))
-    else:
-        mb = range(max(0, last_epoch), a.training_epochs)
-
-    for epoch in mb:
-        if rank == 0:
-            start = time.time()
-            mb.write("Epoch: {}".format(epoch + 1))
-
-        if h.num_gpus > 1:
-            train_sampler.set_epoch(epoch)
+    for epoch in tqdm(range(max(0, last_epoch), a.training_epochs)):
+        start = time.time()
 
         for i, batch in enumerate(train_loader):
-            if rank == 0:
-                start_b = time.time()
+            start_b = time.time()
             x, y, _, y_mel = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -267,121 +238,113 @@ def train(rank, a, h):
                 loss_gen_all.backward()
                 optim_g.step()
 
-            if rank == 0:
-                # STDOUT logging
-                if steps % a.stdout_interval == 0:
-                    with torch.no_grad():
-                        mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
+            # STDOUT logging
+            if steps % a.stdout_interval == 0:
+                with torch.no_grad():
+                    mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
 
-                    mb.write(
-                        "Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, sec/batch : {:4.3f}, peak mem: {:5.2f}GB".format(
-                            steps,
-                            loss_gen_all,
-                            mel_error,
-                            time.time() - start_b,
-                            torch.cuda.max_memory_allocated() / 1e9,
-                        )
+                LOGGER.info(
+                    "Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, sec/batch : {:4.3f}, peak mem: {:5.2f}GB".format(
+                        steps,
+                        loss_gen_all,
+                        mel_error,
+                        time.time() - start_b,
+                        torch.cuda.max_memory_allocated() / 1e9,
                     )
+                )
 
-                # checkpointing
-                if steps % a.checkpoint_interval == 0 and steps != 0:
-                    checkpoint_path = "{}/g_{:08d}.pt".format(a.checkpoint_path, steps)
-                    save_checkpoint(
-                        checkpoint_path,
-                        {
-                            "generator": (
-                                generator.module if h.num_gpus > 1 else generator
-                            ).state_dict()
-                        },
-                    )
-                    checkpoint_path = "{}/do_{:08d}.pt".format(a.checkpoint_path, steps)
-                    save_checkpoint(
-                        checkpoint_path,
-                        {
-                            "mpd": (mpd.module if h.num_gpus > 1 else mpd).state_dict(),
-                            "msd": (msd.module if h.num_gpus > 1 else msd).state_dict(),
-                            "optim_g": optim_g.state_dict(),
-                            "optim_d": optim_d.state_dict(),
-                            "steps": steps,
-                            "epoch": epoch,
-                        },
-                    )
+            # checkpointing
+            if steps % a.checkpoint_interval == 0 and steps != 0:
+                checkpoint_path = "{}/g_{:08d}.pt".format(a.checkpoint_path, steps)
+                save_checkpoint(
+                    checkpoint_path,
+                    {"generator": (generator).state_dict()},
+                )
+                checkpoint_path = "{}/do_{:08d}.pt".format(a.checkpoint_path, steps)
+                save_checkpoint(
+                    checkpoint_path,
+                    {
+                        "mpd": (mpd).state_dict(),
+                        "msd": (msd).state_dict(),
+                        "optim_g": optim_g.state_dict(),
+                        "optim_d": optim_d.state_dict(),
+                        "steps": steps,
+                        "epoch": epoch,
+                    },
+                )
 
-                # Tensorboard summary logging
-                if steps % a.summary_interval == 0:
-                    sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
-                    sw.add_scalar("training/mel_spec_error", mel_error, steps)
-                    sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
+            # Tensorboard summary logging
+            if steps % a.summary_interval == 0:
+                sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
+                sw.add_scalar("training/mel_spec_error", mel_error, steps)
+                sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
 
-                # Validation
-                if steps % a.validation_interval == 0:  # and steps != 0:
-                    generator.eval()
-                    torch.cuda.empty_cache()
-                    val_err_tot = 0
-                    with torch.no_grad():
-                        for j, batch in enumerate(validation_loader):
-                            x, y, _, y_mel = batch
-                            y_g_hat = generator(x.to(device))
-                            y_mel = y_mel.to(device, non_blocking=True)
+            # Validation
+            if steps % a.validation_interval == 0:
+                generator.eval()
+                torch.cuda.empty_cache()
+                val_err_tot = 0
+                with torch.no_grad():
+                    for j, batch in enumerate(validation_loader):
+                        x, y, _, y_mel = batch
+                        y_g_hat = generator(x.to(device))
+                        y_mel = y_mel.to(device, non_blocking=True)
+                        y_g_hat_mel = melspec(y_g_hat.squeeze(1))
+                        if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
+                            # pad it
+                            n_pad = h.hop_size
+                            y_g_hat = F.pad(y_g_hat, (n_pad // 2, n_pad - n_pad // 2))
                             y_g_hat_mel = melspec(y_g_hat.squeeze(1))
-                            if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
-                                # pad it
-                                n_pad = h.hop_size
-                                y_g_hat = F.pad(
-                                    y_g_hat, (n_pad // 2, n_pad - n_pad // 2)
-                                )
-                                y_g_hat_mel = melspec(y_g_hat.squeeze(1))
 
-                            val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
+                        val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
-                            if j <= 4:
-                                if steps == 0:
-                                    sw.add_audio(
-                                        "gt/y_{}".format(j),
-                                        y[0],
-                                        steps,
-                                        h.sampling_rate,
-                                    )
-
+                        if j <= 4:
+                            if steps == 0:
                                 sw.add_audio(
-                                    "generated/y_hat_{}".format(j),
-                                    y_g_hat[0],
+                                    "gt/y_{}".format(j),
+                                    y[0],
                                     steps,
                                     h.sampling_rate,
                                 )
 
-                        val_err = val_err_tot / (j + 1)
-                        sw.add_scalar("validation/mel_spec_error", val_err, steps)
-                        mb.write(
-                            f"validation run complete at {steps:,d} steps. validation mel spec error: {val_err:5.4f}"
-                        )
+                            sw.add_audio(
+                                "generated/y_hat_{}".format(j),
+                                y_g_hat[0],
+                                steps,
+                                h.sampling_rate,
+                            )
 
-                    generator.train()
-                    sw.add_scalar(
-                        "memory/max_allocated_gb",
-                        torch.cuda.max_memory_allocated() / 1e9,
-                        steps,
+                    val_err = val_err_tot / (j + 1)
+                    sw.add_scalar("validation/mel_spec_error", val_err, steps)
+                    LOGGER.info(
+                        f"validation run complete at {steps:,d} steps. validation mel spec error: {val_err:5.4f}"
                     )
-                    sw.add_scalar(
-                        "memory/max_reserved_gb",
-                        torch.cuda.max_memory_reserved() / 1e9,
-                        steps,
-                    )
-                    if "cuda" in device:
-                        torch.cuda.reset_peak_memory_stats()
-                        torch.cuda.reset_accumulated_memory_stats()
+
+                generator.train()
+                sw.add_scalar(
+                    "memory/max_allocated_gb",
+                    torch.cuda.max_memory_allocated() / 1e9,
+                    steps,
+                )
+                sw.add_scalar(
+                    "memory/max_reserved_gb",
+                    torch.cuda.max_memory_reserved() / 1e9,
+                    steps,
+                )
+                if device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.reset_accumulated_memory_stats()
 
             steps += 1
 
         scheduler_g.step()
         scheduler_d.step()
 
-        if rank == 0:
-            LOGGER.info(
-                "Time taken for epoch {} is {} sec".format(
-                    epoch + 1, int(time.time() - start)
-                )
+        LOGGER.info(
+            "Time taken for epoch {} is {} sec".format(
+                epoch + 1, int(time.time() - start)
             )
+        )
 
 
 def main():
@@ -415,24 +378,12 @@ def main():
     torch.manual_seed(h.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(h.seed)
-        h.num_gpus = torch.cuda.device_count()
-        h.batch_size = int(h.batch_size / h.num_gpus)
-        LOGGER.info("Batch size per GPU :", h.batch_size)
+        LOGGER.info("Batch size:", h.batch_size)
     else:
         LOGGER.info("Batch size set to 1 for CPU")
         h.batch_size = 1
 
-    if h.num_gpus > 1:
-        mp.spawn(
-            train,
-            nprocs=h.num_gpus,
-            args=(
-                a,
-                h,
-            ),
-        )
-    else:
-        train(0, a, h)
+    train(a, h)
 
 
 if __name__ == "__main__":
