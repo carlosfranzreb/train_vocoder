@@ -136,9 +136,7 @@ def extract(
 ):
 
     # iterate over all unique speakers
-    for i, (speaker, group) in enumerate(
-        tqdm(df.groupby("speaker"), total=df["speaker"].nunique())
-    ):
+    for _, group in tqdm(df.groupby("speaker"), total=df["speaker"].nunique()):
         # extract features from all the speaker's utterances
         feats = list()
         dump_paths = list()
