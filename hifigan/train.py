@@ -4,6 +4,7 @@ import json
 import os
 import time
 import logging
+import subprocess
 
 import torch
 import torch.nn.functional as F
@@ -50,11 +51,11 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
     msd = MultiScaleDiscriminator().to(device)
 
     # check if ckpt folder already exists and retrieve checkpoints
-    os.makedirs(config.checkpoint_path, exist_ok=True)
-    logger.info("checkpoints directory : ", config.checkpoint_path)
-    if os.path.isdir(config.checkpoint_path):
-        cp_g = scan_checkpoint(config.checkpoint_path, "g_")
-        cp_do = scan_checkpoint(config.checkpoint_path, "do_")
+    os.makedirs(config.ckpt_path, exist_ok=True)
+    logger.info("checkpoints directory : ", config.ckpt_path)
+    if os.path.isdir(config.ckpt_path):
+        cp_g = scan_checkpoint(config.ckpt_path, "g_")
+        cp_do = scan_checkpoint(config.ckpt_path, "do_")
 
     # if ckpt folder is new, start training from scratch
     if cp_g is None or cp_do is None:
@@ -149,7 +150,7 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
     )
     validation_loader = create_dataloader(validset, config, shuffle=False)
 
-    sw = SummaryWriter(config.checkpoint_path)
+    sw = SummaryWriter(config.ckpt_path)
     generator.train()
     mpd.train()
     msd.train()
@@ -236,16 +237,14 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
 
             # checkpointing
             if steps % config.checkpoint_interval == 0 and steps != 0:
-                checkpoint_path = "{}/g_{:08d}.pt".format(config.checkpoint_path, steps)
+                ckpt_path = "{}/g_{:08d}.pt".format(config.ckpt_path, steps)
                 save_checkpoint(
-                    checkpoint_path,
+                    ckpt_path,
                     {"generator": (generator).state_dict()},
                 )
-                checkpoint_path = "{}/do_{:08d}.pt".format(
-                    config.checkpoint_path, steps
-                )
+                ckpt_path = "{}/do_{:08d}.pt".format(config.ckpt_path, steps)
                 save_checkpoint(
-                    checkpoint_path,
+                    ckpt_path,
                     {
                         "mpd": (mpd).state_dict(),
                         "msd": (msd).state_dict(),
@@ -333,7 +332,6 @@ def train(config: AttrDict, logger: logging.Logger, device: str):
 def main():
 
     parser = argparse.ArgumentParser()
-
     parser.add_argument("input_training_file")
     parser.add_argument("input_validation_file")
     parser.add_argument("audio_root_path")
@@ -355,19 +353,24 @@ def main():
     # define logging directory
     json_config = json.loads(data)
     config = AttrDict(json_config)
-    args.checkpoint_path = os.path.join(args.checkpoint_dir, str(int(time.time())))
+    args.ckpt_path = os.path.join(args.checkpoint_dir, str(int(time.time())))
 
     # add args to config
     for key, value in vars(args).items():
         config[key] = value
 
-    # dump config
-    os.makedirs(args.checkpoint_path)
-    json.dump(config, open(os.path.join(args.checkpoint_path, "config.json")))
+    # dump config with commit hash
+    config.commit_hash = (
+        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
+        .decode("ascii")
+        .strip()
+    )
+    os.makedirs(args.ckpt_path)
+    json.dump(config, open(os.path.join(args.ckpt_path, "config.json")))
 
     # create logger
     logger = logging.getLogger("train")
-    handler = logging.FileHandler(os.path.join(args.checkpoint_path, "train.log"))
+    handler = logging.FileHandler(os.path.join(args.ckpt_path, "train.log"))
     handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
