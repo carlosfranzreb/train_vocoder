@@ -8,7 +8,7 @@ import logging
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -31,6 +31,20 @@ from .utils import (
 )
 
 torch.backends.cudnn.benchmark = True
+
+
+def create_dataloader(
+    dataset: Dataset, config: AttrDict, shuffle: bool = True
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        num_workers=config.num_workers,
+        shuffle=shuffle,
+        batch_size=config.batch_size,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True,
+    )
 
 
 def train(args, config, logger, device):
@@ -109,16 +123,7 @@ def train(args, config, logger, device):
         audio_root_path=args.audio_root_path,
         feat_root_path=args.feature_root_path,
     )
-
-    train_loader = DataLoader(
-        trainset,
-        num_workers=config.num_workers,
-        shuffle=False,
-        batch_size=config.batch_size,
-        pin_memory=True,
-        persistent_workers=True,
-        drop_last=True,
-    )
+    train_loader = create_dataloader(trainset, config)
 
     melspec = LogMelSpectrogram(
         config.n_fft,
@@ -148,18 +153,9 @@ def train(args, config, logger, device):
         audio_root_path=args.audio_root_path,
         feat_root_path=args.feature_root_path,
     )
-    validation_loader = DataLoader(
-        validset,
-        num_workers=1,
-        shuffle=False,
-        batch_size=1,
-        pin_memory=True,
-        persistent_workers=True,
-        drop_last=True,
-    )
+    validation_loader = create_dataloader(validset, config, shuffle=False)
 
     sw = SummaryWriter(args.checkpoint_path)
-
     generator.train()
     mpd.train()
     msd.train()
