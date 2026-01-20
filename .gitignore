@@ -138,3 +138,5 @@ dmypy.json
 *.pt
 *.log
 cp_hifigan/
+logs/
+config.json

@@ -4,4 +4,7 @@ pre_commit==4.5.1
 ruff==0.14.11
 torch==2.9.1
 torchcodec==0.9.1
+torchaudio==2.9.1
 tqdm==4.67.1
+tensorboard==2.20.0
+line_profiler-5.0.0

@@ -129,25 +129,9 @@ Then, to train the HiFiGAN:
     └── WavLM.py                            # wavlm modules (from original WavLM repo)
 ```
 
+## Optimize train
 
-## Acknowledgements
+Training on 1 H200:
 
-Parts of code for this project are adapted from the following repositories -- please make sure to check them out! Thank you to the authors of:
-
-- HiFiGAN: https://github.com/jik876/hifi-gan
-- WavLM: https://github.com/microsoft/unilm/tree/master/wavlm
-
-
-## Citation
-
-```bibtex
-@inproceedings{baas2023knnvc,
-  author={Matthew Baas and Benjamin van Niekerk and Herman Kamper},
-  title={Voice Conversion With Just Nearest Neighbors},
-  year=2023,
-  booktitle={Interspeech},
-}
-```
-
-
-
+- commit a51930398: 460s per epoch on /cfs
+- commit a51930398: 160s per epoch on /tmp (increasing workers from 10 to 20, which I think has a bigger impact).
