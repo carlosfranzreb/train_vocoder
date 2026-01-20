@@ -264,35 +264,19 @@ def train(config: AttrDict, logger: logging.Logger):
                         y_mel = y_mel.to(device, non_blocking=True)
                         y_g_hat_mel = melspec(y_g_hat.squeeze(1))
                         if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
-                            # pad it
                             n_pad = config.hop_size
                             y_g_hat = F.pad(y_g_hat, (n_pad // 2, n_pad - n_pad // 2))
                             y_g_hat_mel = melspec(y_g_hat.squeeze(1))
 
                         val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
-                        if j <= 4:
-                            if steps == 0:
-                                sw.add_audio(
-                                    "gt/y_{}".format(j),
-                                    y[0],
-                                    steps,
-                                    config.sampling_rate,
-                                )
-
-                            sw.add_audio(
-                                "generated/y_hat_{}".format(j),
-                                y_g_hat[0],
-                                steps,
-                                config.sampling_rate,
-                            )
-
                     val_err = val_err_tot / (j + 1)
-                    sw.add_scalar("validation/mel_spec_error", val_err, steps)
+                    sw.add_scalar("val/mel_spec_error", val_err, steps)
                     logger.info(
-                        f"validation run complete at {steps:,d} steps. validation mel spec error: {val_err:5.4f}"
+                        f"val. done at {steps:,d} steps. mel spec error: {val_err:5.4f}"
                     )
 
+                # go back to training
                 generator.train()
                 sw.add_scalar(
                     "memory/max_allocated_gb",
@@ -312,7 +296,6 @@ def train(config: AttrDict, logger: logging.Logger):
 
         scheduler_g.step()
         scheduler_d.step()
-
         logger.info(
             "Time taken for epoch {} is {} sec".format(
                 epoch + 1, int(time.time() - start)
