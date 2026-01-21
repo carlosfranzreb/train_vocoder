@@ -88,7 +88,7 @@ def main(args):
 def get_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
     """
     Extracts WavLM features from the given audio path, and returns them as a single
-    tensor of shape (n_feats, feat_dim).
+    tensor of shape (1, n_feats, feat_dim).
     """
 
     # load audio and ensure it's divisible by WavLM's featex
@@ -98,9 +98,13 @@ def get_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
 
     # extract the representation of each layer
     x = x.to(device)
-    features = wavlm.extract_features(
-        x, output_layer=wavlm.extract_from_layer, ret_layer_results=True
-    )[0][1][-1][0].squeeze(1)
+    features = (
+        wavlm.extract_features(
+            x, output_layer=wavlm.extract_from_layer, ret_layer_results=True
+        )[0][1][-1][0]
+        .squeeze(1)
+        .unsqueeze(0)
+    )
 
     return features
 

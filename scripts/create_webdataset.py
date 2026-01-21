@@ -3,7 +3,8 @@ Creates a webdataset for training a HiFiGAN with SSL features. Each sample compr
 audio file and its corresponding SSL features.
 
 Both folders should have the same folder structure. We iterate over the SSl folder and
-expect to find the corresponding audio at the same relative location.
+expect to find the corresponding audio at the same relative location. We flatten the
+directory structure, so make sure each file has a unique name.
 """
 
 import argparse
