@@ -137,6 +137,6 @@ dmypy.json
 *.flac
 *.pt
 *.log
+*.tar
 cp_hifigan/
 logs/
-config.json
