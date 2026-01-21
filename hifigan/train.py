@@ -94,10 +94,9 @@ class Trainer:
         self.scaler_d = GradScaler(self.device, enabled=config.fp16)
 
         # create dataloaders
-        tar_train = [f for f in os.listdir(config.tar_dir) if f not in config.tar_val]
-        self.train_loader = create_dataloader(config.tar_dir, tar_train, config, logger)
+        self.train_loader = create_dataloader(config.train_tars, config, logger)
         self.valid_loader = create_dataloader(
-            config.tar_dir, config.tar_val, config, logger, shuffle=False
+            config.valid_tars, config, logger, shuffle=False
         )
 
         # initialize mel-spectrogram transform
@@ -386,7 +385,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
         logger.info("Batch size:", config.batch_size)
-        config.self.device = "cuda"
+        config.device = "cuda"
     else:
         logger.info("Batch size set to 1 for CPU")
         config.batch_size = 1

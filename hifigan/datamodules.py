@@ -23,7 +23,7 @@ class WdsAudioDecoder:
         self.sr = sample_rate
 
     def __call__(self, audio: bytes) -> Tensor:
-        encoded_data = torch.frombuffer(audio, dtype=torch.uint8)
+        encoded_data = torch.frombuffer(audio, dtype=torch.uint8).clone()
         return AudioDecoder(encoded_data, sample_rate=self.sr).get_all_samples().data
 
 
@@ -41,14 +41,17 @@ def is_not_metadata(sample: str) -> bool:
 
 def create_dataloader(
     tar_dir: str,
-    tar_files: list[str],
     config: DictConfig,
     logger: logging.Logger,
     shuffle: bool = True,
 ) -> DataLoader:
-    tar_paths = [os.path.join(tar_dir, f) for f in tar_files]
+    tar_paths = [
+        os.path.join(tar_dir, f)
+        for f in os.listdir(tar_dir)
+        if f.endswith(".tar")
+    ]
     logger.info(
-        f"Creating dataloader with {len(tar_files)} tar files and shuffle={shuffle}"
+        f"Creating dataloader with {len(tar_paths)} tar files and shuffle={shuffle}"
     )
     dataset = (
         wds.WebDataset(tar_paths)
@@ -62,11 +65,11 @@ def create_dataloader(
         dataset = dataset.shuffle(config.n_shuffle)
 
     n_workers = config.num_workers
-    if len(tar_files) < n_workers:
+    if len(tar_paths) < n_workers:
         logger.warning(
-            f"There are more workers ({n_workers}) than tars ({len(tar_files)})"
+            f"There are more workers ({n_workers}) than tars ({len(tar_paths)})"
         )
-        n_workers = len(tar_files)
+        n_workers = len(tar_paths)
 
     return DataLoader(
         dataset,
