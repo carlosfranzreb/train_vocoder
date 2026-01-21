@@ -2,6 +2,8 @@ import math
 import random
 from io import BytesIO
 from dataclasses import dataclass
+import logging
+import os
 
 import torch
 from torch import Tensor
@@ -21,7 +23,6 @@ class WdsAudioDecoder:
         self.sr = sample_rate
 
     def __call__(self, audio: bytes) -> Tensor:
-        # TODO: is casting to uint8 okay?
         encoded_data = torch.frombuffer(audio, dtype=torch.uint8)
         return AudioDecoder(encoded_data, sample_rate=self.sr).get_all_samples().data
 
@@ -39,10 +40,18 @@ def is_not_metadata(sample: str) -> bool:
 
 
 def create_dataloader(
-    tar_file: str, config: DictConfig, shuffle: bool = True
+    tar_dir: str,
+    tar_files: list[str],
+    config: DictConfig,
+    logger: logging.Logger,
+    shuffle: bool = True,
 ) -> DataLoader:
+    tar_paths = [os.path.join(tar_dir, f) for f in tar_files]
+    logger.info(
+        f"Creating dataloader with {len(tar_files)} tar files and shuffle={shuffle}"
+    )
     dataset = (
-        wds.WebDataset(tar_file)
+        wds.WebDataset(tar_paths)
         .select(is_not_metadata)
         .decode(
             wds.handle_extension("pt", decode_pt),
@@ -52,12 +61,19 @@ def create_dataloader(
     if shuffle:
         dataset = dataset.shuffle(config.n_shuffle)
 
+    n_workers = config.num_workers
+    if len(tar_files) < n_workers:
+        logger.warning(
+            f"There are more workers ({n_workers}) than tars ({len(tar_files)})"
+        )
+        n_workers = len(tar_files)
+
     return DataLoader(
         dataset,
         collate_fn=Collator(
             config.segment_size, config.hifigan.hop_size, config.audio_ext
         ),
-        num_workers=config.num_workers,
+        num_workers=n_workers,
         batch_size=config.batch_size,
         pin_memory=config.device == "cuda",
         persistent_workers=config.num_workers > 0,

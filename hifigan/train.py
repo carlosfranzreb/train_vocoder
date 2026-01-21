@@ -94,8 +94,11 @@ class Trainer:
         self.scaler_d = GradScaler(self.device, enabled=config.fp16)
 
         # create dataloaders
-        self.train_loader = create_dataloader(config.train_file, config)
-        self.valid_loader = create_dataloader(config.valid_file, config, shuffle=False)
+        tar_train = [f for f in os.listdir(config.tar_dir) if f not in config.tar_val]
+        self.train_loader = create_dataloader(config.tar_dir, tar_train, config, logger)
+        self.valid_loader = create_dataloader(
+            config.tar_dir, config.tar_val, config, logger, shuffle=False
+        )
 
         # initialize mel-spectrogram transform
         self.melspec = LogMelSpectrogram(
@@ -171,7 +174,7 @@ class Trainer:
 
                 self.steps += 1
 
-            # epoch is done; update scheduler and log epoch duration
+            # epoch is done; update schedulers and log epoch duration
             self.scheduler_g.step()
             self.scheduler_d.step()
             self.logger.info(
