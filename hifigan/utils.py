@@ -30,12 +30,6 @@ def load_checkpoint(filepath, device):
     return checkpoint_dict
 
 
-def save_checkpoint(filepath, obj):
-    print("Saving checkpoint to {}".format(filepath))
-    torch.save(obj, filepath)
-    print("Complete.")
-
-
 def scan_checkpoint(cp_dir, prefix):
     pattern = os.path.join(cp_dir, prefix + "*")
     cp_list = glob.glob(pattern)

@@ -50,7 +50,7 @@ def create_dataloader(
         )
     )
     if shuffle:
-        dataset = dataset.shuffle(1_000)
+        dataset = dataset.shuffle(config.n_shuffle)
 
     return DataLoader(
         dataset,
