@@ -141,19 +141,21 @@ class Trainer:
                     self.generator.eval()
                     torch.cuda.empty_cache()
                     val_err_tot = 0
+                    n_batches = 0
                     with torch.no_grad():
-                        for j, batch in enumerate(self.valid_loader):
+                        for batch in self.valid_loader:
                             val_err = self.valid_batch(batch)
                             val_err_tot += val_err
+                            n_batches += 1
 
-                        # log avg. mel-spech error on the validation set
-                        val_err = val_err_tot / (j + 1)
-                        self.tb_logger.add_scalar(
-                            "val/mel_spec_error", val_err, self.steps
-                        )
-                        self.logger.info(
-                            f"val. done at {self.steps:,d} steps. mel spec error: {val_err:5.4f}"
-                        )
+                    # log avg. mel-spech error on the validation set
+                    val_err = val_err_tot / n_batches
+                    self.tb_logger.add_scalar(
+                        "val/mel_spec_error", val_err, self.steps
+                    )
+                    self.logger.info(
+                        f"val. done at {self.steps:,d} steps. mel spec error: {val_err:5.4f}"
+                    )
 
                     # go back to training
                     self.generator.train()

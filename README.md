@@ -135,3 +135,8 @@ Training on 1 H200:
 
 - commit a51930398: 460s per epoch on /cfs
 - commit a51930398: 160s per epoch on /tmp (increasing workers from 10 to 20, which I think has a bigger impact).
+
+Training on 1 RTX 6000 (Ada):
+
+- commit 07ccfa0: 120s per epoch with webdataset (same bs=32 and n_workers=20 as before)
+- commit 07ccfa0: 120s per epoch with webdataset (n_workers=50)

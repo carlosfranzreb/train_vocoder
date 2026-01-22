@@ -80,7 +80,6 @@ def create_dataloader(
         batch_size=config.batch_size,
         pin_memory=config.device == "cuda",
         persistent_workers=config.num_workers > 0,
-        drop_last=True,
     )
 
 
